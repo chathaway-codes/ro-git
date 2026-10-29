@@ -17,8 +17,10 @@ if ! git show-ref --quiet --heads issues-data; then
 fi
 
 if git worktree list | grep -q "[ /]issues\b"; then
+    git worktree repair issues >/dev/null 2>&1 || true
     echo "issues/ worktree already mounted."
 elif [ -d "issues" ]; then
+    git worktree repair issues >/dev/null 2>&1 || true
     echo "issues/ directory already exists."
 else
     echo "Mounting issues/ worktree on issues-data branch..."

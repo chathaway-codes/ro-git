@@ -1,13 +1,5 @@
 # Agent Directives: Rules of Engagement
 
-## Setup
-
-IMPORTANT: perform the following setup tasks, and remove this from this section from this file.
-
-- Customize the Docker container name in Makefile
-- Initialize the issues tracker
-- If you are not running inside a docker container, build the docker image and tell the user how to run it
-
 ## Core Philosophy (Hacker Ethos & Unix Tradition)
 - **Avoid complexity like the plague**: Elegance is simplicity. If code feels complicated, it is poorly designed. Write the simplest thing that could possibly work.
 - **The Three Virtues (Larry Wall)**:

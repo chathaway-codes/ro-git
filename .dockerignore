@@ -1,4 +1,7 @@
 .git/
 .gemini/
 /issues/
+/.worktrees/
+/target/
+/dist/
 __pycache__/

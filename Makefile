@@ -1,8 +1,8 @@
-.PHONY: help test test-issues issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
+.PHONY: help test check test-issues issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
 
-PROJECT_NAME ?= $(notdir $(CURDIR))
-DOCKER_IMAGE ?= agent-workspace:latest
-CONTAINER_NAME ?= agy-$(PROJECT_NAME)
+PROJECT_NAME ?= ro-git
+DOCKER_IMAGE ?= $(PROJECT_NAME)-workspace:latest
+CONTAINER_NAME ?= agy-ro-git
 DATA_VOLUME ?= agy-data-$(PROJECT_NAME)
 
 help: ## Show this help message
@@ -10,6 +10,8 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 test: test-issues ## Run test suite
+
+check: test ## Alias for test
 
 test-issues: ## Run unit tests for git issue tracker CLI and server
 	python3 tests/test_issue_tooling.py
@@ -24,7 +26,7 @@ issues-ui: ## Launch read-only issue browser Web UI on port 8080
 	python3 scripts/issue_server.py --port 8080
 
 clean: ## Clean generated test caches and temporary files
-	rm -rf __pycache__ tests/__pycache__ scripts/__pycache__
+	rm -rf __pycache__ tests/__pycache__ scripts/__pycache__ target dist
 
 docker-build: ## Build containerized development Docker image
 	docker build -t $(DOCKER_IMAGE) .

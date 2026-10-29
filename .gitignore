@@ -1,9 +1,18 @@
+# Rust / Cargo build artifacts
+/target/
+**/target/
+
+# Trunk / WASM frontend build output
+/dist/
+**/dist/
+
 # Python bytecode & cache
 __pycache__/
 *.pyc
 
-# Local git-stored issue tracker worktree
+# Local git-stored issue tracker and implementation worktrees
 /issues/
+/.worktrees/
 
 # Logs & temp files
 *.log
