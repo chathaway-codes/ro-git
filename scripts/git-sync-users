@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -21,50 +22,70 @@ NOBODY_ID = 65534
 MIN_USER_ID = 1000
 MIN_TEAM_GID = 2000
 
+DEFAULT_PASSWD_ROWS = [
+    ["root", "x", "0", "0", "root", "/root", "/bin/sh"],
+    ["nobody", "x", str(NOBODY_ID), str(NOBODY_ID), "nobody", "/", "/usr/sbin/nologin"],
+]
+DEFAULT_GROUP_ROWS = [
+    ["root", "x", "0", ""],
+    ["nobody", "x", str(NOBODY_ID), ""],
+]
+
 
 def _is_valid_name(name: str) -> bool:
     return bool(VALID_NAME_RE.match(name))
 
 
+def _reject_symlink(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Refusing to operate on symlink: {path}")
+
+
 def _safe_chown_chmod(path: Path, uid: int, gid: int, mode: int) -> None:
-    """Apply chown (ignoring EPERM when unprivileged) followed by chmod."""
+    """Apply chown (ignoring EPERM when unprivileged) followed by chmod without following symlinks."""
+    _reject_symlink(path)
     try:
-        os.chown(path, uid, gid)
+        os.chown(path, uid, gid, follow_symlinks=False)
     except PermissionError:
         pass
     os.chmod(path, mode)
 
 
-def _parse_passwd(passwd_path: Path) -> List[List[str]]:
-    if not passwd_path.exists():
-        return [
-            ["root", "x", "0", "0", "root", "/root", "/bin/sh"],
-            ["nobody", "x", str(NOBODY_ID), str(NOBODY_ID), "nobody", "/", "/usr/sbin/nologin"],
-        ]
+def _ensure_real_dir(path: Path, uid: int, gid: int, mode: int) -> None:
+    """Ensure path is a real directory (not a symlink) and enforce ownership and mode."""
+    _reject_symlink(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError(f"Expected real directory at {path}")
+    _safe_chown_chmod(path, uid, gid, mode)
+
+
+def _write_atomic(path: Path, content: str, uid: int = 0, gid: int = 0, mode: int = 0o644) -> None:
+    """Write content to a temporary file in path.parent, set permissions, and atomically replace path."""
+    _reject_symlink(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        _safe_chown_chmod(tmp_path, uid, gid, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _parse_colon_file(path: Path, field_count: int, defaults: List[List[str]]) -> List[List[str]]:
+    _reject_symlink(path)
+    if not path.exists():
+        return [list(row) for row in defaults]
     rows: List[List[str]] = []
-    for raw in passwd_path.read_text(encoding="utf-8").splitlines():
+    for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line:
             continue
         parts = line.split(":")
-        if len(parts) == 7:
-            rows.append(parts)
-    return rows
-
-
-def _parse_group(group_path: Path) -> List[List[str]]:
-    if not group_path.exists():
-        return [
-            ["root", "x", "0", ""],
-            ["nobody", "x", str(NOBODY_ID), ""],
-        ]
-    rows: List[List[str]] = []
-    for raw in group_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        parts = line.split(":")
-        if len(parts) == 4:
+        if len(parts) == field_count:
             rows.append(parts)
     return rows
 
@@ -75,6 +96,7 @@ def _is_managed_passwd_row(row: List[str]) -> bool:
 
 
 def _read_team_members(members_file: Path) -> List[str]:
+    _reject_symlink(members_file)
     if not members_file.exists() or not members_file.is_file():
         return []
     seen: Set[str] = set()
@@ -89,12 +111,47 @@ def _read_team_members(members_file: Path) -> List[str]:
     return members
 
 
-def _next_free_id(start: int, used: Set[int]) -> int:
+def _next_free_id(start: int, *used_sets: Set[int]) -> int:
     candidate = start
-    while candidate in used or candidate == NOBODY_ID:
+    while candidate == NOBODY_ID or any(candidate in s for s in used_sets):
         candidate += 1
-    used.add(candidate)
+    for s in used_sets:
+        s.add(candidate)
     return candidate
+
+
+def _enforce_user_permissions(users_dir: Path, user_ids: Dict[str, Tuple[int, int]]) -> None:
+    for user, (uid, gid) in user_ids.items():
+        udir = users_dir / user
+        auth_keys = udir / "authorized_keys"
+        for p in (udir, udir / "public", udir / "private", auth_keys):
+            _reject_symlink(p)
+
+        _ensure_real_dir(udir, uid, gid, 0o755)
+        _ensure_real_dir(udir / "public", uid, gid, 0o755)
+        _ensure_real_dir(udir / "private", uid, gid, 0o700)
+
+        if auth_keys.exists():
+            if not auth_keys.is_file():
+                raise ValueError(f"Expected regular file at {auth_keys}")
+            _safe_chown_chmod(auth_keys, uid, gid, 0o600)
+
+
+def _enforce_team_permissions(teams_dir: Path, team_gids: Dict[str, int]) -> None:
+    for team, tgid in team_gids.items():
+        tdir = teams_dir / team
+        members_file = tdir / "members"
+        for p in (tdir, tdir / "public", tdir / "private", members_file):
+            _reject_symlink(p)
+
+        _ensure_real_dir(tdir, 0, tgid, 0o755)
+        _ensure_real_dir(tdir / "public", 0, tgid, 0o2775)
+        _ensure_real_dir(tdir / "private", 0, tgid, 0o2770)
+
+        if members_file.exists():
+            if not members_file.is_file():
+                raise ValueError(f"Expected regular file at {members_file}")
+            _safe_chown_chmod(members_file, 0, tgid, 0o640)
 
 
 def sync_users_and_groups(
@@ -106,7 +163,7 @@ def sync_users_and_groups(
 
     if etc_dir is not None:
         etc = Path(etc_dir)
-    elif "RO_GIT_ETC_DIR" in os.environ and os.environ["RO_GIT_ETC_DIR"]:
+    elif os.environ.get("RO_GIT_ETC_DIR"):
         etc = Path(os.environ["RO_GIT_ETC_DIR"])
     else:
         etc = root / "etc"
@@ -114,12 +171,9 @@ def sync_users_and_groups(
     users_dir = root / "users"
     teams_dir = root / "teams"
 
-    users_dir.mkdir(parents=True, exist_ok=True)
-    teams_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_real_dir(users_dir, 0, 0, 0o755)
+    _ensure_real_dir(teams_dir, 0, 0, 0o755)
     etc.mkdir(parents=True, exist_ok=True)
-
-    _safe_chown_chmod(users_dir, 0, 0, 0o755)
-    _safe_chown_chmod(teams_dir, 0, 0, 0o755)
 
     discovered_users = sorted(
         p.name for p in users_dir.iterdir() if p.is_dir() and not p.is_symlink() and _is_valid_name(p.name)
@@ -131,10 +185,9 @@ def sync_users_and_groups(
     passwd_path = etc / "passwd"
     group_path = etc / "group"
 
-    existing_passwd = _parse_passwd(passwd_path)
-    existing_group = _parse_group(group_path)
+    existing_passwd = _parse_colon_file(passwd_path, 7, DEFAULT_PASSWD_ROWS)
+    existing_group = _parse_colon_file(group_path, 4, DEFAULT_GROUP_ROWS)
 
-    # Identify preserved (unmanaged/system) passwd entries and previously managed entries
     system_passwd: List[List[str]] = []
     managed_passwd_by_name: Dict[str, List[str]] = {}
     system_user_names: Set[str] = set()
@@ -145,8 +198,7 @@ def sync_users_and_groups(
     for row in existing_passwd:
         name = row[0]
         try:
-            uid = int(row[2])
-            gid = int(row[3])
+            uid, gid = int(row[2]), int(row[3])
         except ValueError:
             continue
         if _is_managed_passwd_row(row):
@@ -182,7 +234,6 @@ def sync_users_and_groups(
         elif gname in discovered_users or gname in discovered_teams:
             used_gids.add(gid)
 
-    # Reconcile users
     user_ids: Dict[str, Tuple[int, int]] = {}
     new_user_passwd_rows: List[List[str]] = []
     new_user_group_rows: List[List[str]] = []
@@ -199,38 +250,25 @@ def sync_users_and_groups(
             else:
                 uid = _next_free_id(MIN_USER_ID, used_uids)
         else:
-            candidate = MIN_USER_ID
-            while candidate in used_uids or candidate in used_gids or candidate == NOBODY_ID:
-                candidate += 1
-            uid = candidate
-            gid = candidate
-            used_uids.add(uid)
-            used_gids.add(gid)
+            uid = _next_free_id(MIN_USER_ID, used_uids, used_gids)
+            gid = uid
 
         user_ids[user] = (uid, gid)
-        new_user_passwd_rows.append([
-            user,
-            "x",
-            str(uid),
-            str(gid),
-            user,
-            f"/users/{user}",
-            GIT_AUTO_SHELL,
-        ])
+        new_user_passwd_rows.append([user, "x", str(uid), str(gid), user, f"/users/{user}", GIT_AUTO_SHELL])
         if user not in discovered_teams:
             new_user_group_rows.append([user, "x", str(gid), ""])
 
-    # Reconcile teams
     team_gids: Dict[str, int] = {}
     team_members_map: Dict[str, List[str]] = {}
     new_team_group_rows: List[List[str]] = []
 
     for team in discovered_teams:
-        members_file = teams_dir / team / "members"
-        members = _read_team_members(members_file)
+        members = _read_team_members(teams_dir / team / "members")
         team_members_map[team] = members
 
-        if team in existing_group_by_name:
+        if team in user_ids:
+            gid = user_ids[team][1]
+        elif team in existing_group_by_name:
             gid = int(existing_group_by_name[team][2])
             used_gids.add(gid)
         else:
@@ -239,53 +277,14 @@ def sync_users_and_groups(
         team_gids[team] = gid
         new_team_group_rows.append([team, "x", str(gid), ",".join(members)])
 
-    # Write <etc>/passwd and <etc>/group atomically
     final_passwd_rows = system_passwd + new_user_passwd_rows
     final_group_rows = system_groups + new_user_group_rows + new_team_group_rows
 
-    passwd_content = "\n".join(":".join(r) for r in final_passwd_rows) + "\n"
-    group_content = "\n".join(":".join(r) for r in final_group_rows) + "\n"
+    _write_atomic(passwd_path, "\n".join(":".join(r) for r in final_passwd_rows) + "\n")
+    _write_atomic(group_path, "\n".join(":".join(r) for r in final_group_rows) + "\n")
 
-    passwd_path.write_text(passwd_content, encoding="utf-8")
-    group_path.write_text(group_content, encoding="utf-8")
-    _safe_chown_chmod(passwd_path, 0, 0, 0o644)
-    _safe_chown_chmod(group_path, 0, 0, 0o644)
-
-    # Enforce directory structure, ownership, and permission invariants for users
-    for user in discovered_users:
-        uid, gid = user_ids[user]
-        udir = users_dir / user
-        pub_dir = udir / "public"
-        priv_dir = udir / "private"
-        auth_keys = udir / "authorized_keys"
-
-        pub_dir.mkdir(parents=True, exist_ok=True)
-        priv_dir.mkdir(parents=True, exist_ok=True)
-
-        _safe_chown_chmod(udir, uid, gid, 0o755)
-        _safe_chown_chmod(pub_dir, uid, gid, 0o755)
-        _safe_chown_chmod(priv_dir, uid, gid, 0o700)
-
-        if auth_keys.exists() and auth_keys.is_file():
-            _safe_chown_chmod(auth_keys, uid, gid, 0o600)
-
-    # Enforce directory structure, ownership, and permission invariants for teams
-    for team in discovered_teams:
-        tgid = team_gids[team]
-        tdir = teams_dir / team
-        pub_dir = tdir / "public"
-        priv_dir = tdir / "private"
-        members_file = tdir / "members"
-
-        pub_dir.mkdir(parents=True, exist_ok=True)
-        priv_dir.mkdir(parents=True, exist_ok=True)
-
-        _safe_chown_chmod(tdir, 0, tgid, 0o755)
-        _safe_chown_chmod(pub_dir, 0, tgid, 0o2775)
-        _safe_chown_chmod(priv_dir, 0, tgid, 0o2770)
-
-        if members_file.exists() and members_file.is_file():
-            _safe_chown_chmod(members_file, 0, tgid, 0o640)
+    _enforce_user_permissions(users_dir, user_ids)
+    _enforce_team_permissions(teams_dir, team_gids)
 
     return {
         "users": user_ids,

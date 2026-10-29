@@ -337,6 +337,64 @@ class TestGitSyncUsers(unittest.TestCase):
         self.assertIn("alice:x:1001:1001:alice:/users/alice:/usr/local/bin/git-auto-shell\n", passwd_after)
         self.assertNotIn("charlie:", passwd_after)
 
+    def test_rejects_symlinks_in_user_and_team_trees(self):
+        target_file = self.root / "secret_target"
+        target_file.write_text("sensitive\n", encoding="utf-8")
+        os.chmod(target_file, 0o644)
+
+        alice_dir = self.root / "users" / "alice"
+        alice_dir.mkdir(parents=True)
+        (alice_dir / "authorized_keys").symlink_to(target_file)
+
+        res = self._run_sync()
+        self.assertNotEqual(res.returncode, 0)
+        # Ensure target file mode was NOT modified via symlink
+        self.assertEqual(stat.S_IMODE(target_file.stat().st_mode), 0o644)
+
+        # Also verify symlinked public directory is rejected
+        (alice_dir / "authorized_keys").unlink()
+        target_dir = self.root / "target_dir"
+        target_dir.mkdir()
+        os.chmod(target_dir, 0o700)
+        (alice_dir / "public").symlink_to(target_dir)
+
+        res_dir = self._run_sync()
+        self.assertNotEqual(res_dir.returncode, 0)
+        self.assertEqual(stat.S_IMODE(target_dir.stat().st_mode), 0o700)
+
+    def test_shared_user_and_team_name_has_consistent_gid(self):
+        (self.root / "users" / "devops").mkdir(parents=True)
+        (self.root / "users" / "alice").mkdir(parents=True)
+        team_dir = self.root / "teams" / "devops"
+        team_dir.mkdir(parents=True)
+        (team_dir / "members").write_text("devops\nalice\n", encoding="utf-8")
+
+        res1 = self._run_sync()
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+
+        passwd_text = (self.etc / "passwd").read_text(encoding="utf-8")
+        group_text = (self.etc / "group").read_text(encoding="utf-8")
+
+        # Extract devops primary GID from passwd and group GID from group
+        passwd_gids = {
+            line.split(":")[0]: int(line.split(":")[3])
+            for line in passwd_text.splitlines()
+            if line.strip()
+        }
+        group_gids = {
+            line.split(":")[0]: int(line.split(":")[2])
+            for line in group_text.splitlines()
+            if line.strip()
+        }
+        self.assertEqual(passwd_gids["devops"], group_gids["devops"])
+        self.assertIn(f"devops:x:{group_gids['devops']}:devops,alice\n", group_text)
+
+        # Verify idempotency on second run
+        res2 = self._run_sync()
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual((self.etc / "passwd").read_text(encoding="utf-8"), passwd_text)
+        self.assertEqual((self.etc / "group").read_text(encoding="utf-8"), group_text)
+
 
 if __name__ == "__main__":
     unittest.main()
