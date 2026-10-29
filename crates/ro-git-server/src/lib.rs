@@ -24,8 +24,8 @@ use ro_git_proto::ro_git::v1::{
     GetTreeRequestView, GetTreeResponseBuilder, GetTreeResponseView, ListCommitsRequestBuilder,
     ListCommitsRequestView, ListCommitsResponseBuilder, ListCommitsResponseView,
     ListRepositoriesRequestBuilder, ListRepositoriesRequestView, ListRepositoriesResponseBuilder,
-    ListRepositoriesResponseView, WorkerRequestBuilder, WorkerRequestView, WorkerResponseBuilder,
-    WorkerResponseView,
+    ListRepositoriesResponseView, RepositoryInfoBuilder, WorkerRequestBuilder, WorkerRequestView,
+    WorkerResponseBuilder, WorkerResponseView,
 };
 use ro_git_proto::{
     decode_bearer_token, format_canonical_path, format_clone_command, format_ssh_url,
@@ -178,6 +178,18 @@ pub struct DiscoveredRepository {
     pub canonical_path: String,
     pub ssh_url: String,
     pub clone_command: String,
+}
+
+impl DiscoveredRepository {
+    pub(crate) fn encode_into(&self, r: &mut RepositoryInfoBuilder<'_>) {
+        r.write_clone_command(&self.clone_command)
+            .write_ssh_url(&self.ssh_url)
+            .write_canonical_path(&self.canonical_path)
+            .write_name(&self.name)
+            .write_visibility(&self.visibility)
+            .write_owner(&self.owner)
+            .write_scope(&self.scope);
+    }
 }
 
 /// Repository filter parameters for `ListRepositories`.
@@ -827,6 +839,23 @@ fn encode_worker_error(code: GrpcCode, message: &str) -> Vec<u8> {
         .to_vec()
 }
 
+fn encode_worker_ok(
+    buf_size: usize,
+    write_payload: impl FnOnce(&mut WorkerResponseBuilder<'_>) -> bool,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; buf_size];
+    let mut builder = WorkerResponseBuilder::new(&mut buf);
+    let ok = write_payload(&mut builder);
+    builder.write_status_code(GrpcCode::Ok as u32);
+    if !ok {
+        return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
+    }
+    match builder.finish() {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted"),
+    }
+}
+
 /// Executes a serialized `WorkerRequest` inside the worker context and returns
 /// the serialized `WorkerResponse` protobuf payload.
 #[must_use]
@@ -876,24 +905,17 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
 
     match req_view.command() {
         Ok(Some(worker_request::Command::GetAuthStatus(_))) => {
-            let mut buf = vec![0u8; 2048];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            builder
-                .write_auth_status(|auth| {
+            encode_worker_ok(2048, |builder| {
+                builder.write_auth_status(|auth| {
                     auth.write_ssh_host(ssh_host);
                     if let Some(ref user) = creds.username {
                         auth.write_username(user).write_authenticated(true);
                     } else {
                         auth.write_username("").write_authenticated(false);
                     }
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                true
+            })
         }
         Ok(Some(worker_request::Command::ListRepositories(lr))) => {
             let filter = RepositoryFilter {
@@ -903,40 +925,22 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 query: lr.query().unwrap_or(""),
             };
             let repos = discover_repositories(root_dir, ssh_host, &creds, &filter);
-            let mut buf = vec![0u8; 65_536];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut overflow = false;
-            builder
-                .write_list_repositories(|list_resp| {
+            encode_worker_ok(65_536, |builder| {
+                let mut ok = true;
+                builder.write_list_repositories(|list_resp| {
                     list_resp
                         .write_ssh_host(ssh_host)
                         .write_authenticated_user(creds.username.as_deref().unwrap_or(""));
                     for repo in repos.iter().rev() {
-                        list_resp.write_repositories(|r| {
-                            r.write_clone_command(&repo.clone_command)
-                                .write_ssh_url(&repo.ssh_url)
-                                .write_canonical_path(&repo.canonical_path)
-                                .write_name(&repo.name)
-                                .write_visibility(&repo.visibility)
-                                .write_owner(&repo.owner)
-                                .write_scope(&repo.scope);
-                        });
+                        list_resp.write_repositories(|r| repo.encode_into(r));
                         if list_resp.check().is_err() {
-                            overflow = true;
+                            ok = false;
                             break;
                         }
                     }
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if overflow {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(Some(worker_request::Command::GetRepository(gr))) => {
             let inspection = match inspect_repository(
@@ -952,23 +956,13 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 Ok(v) => v,
                 Err((code, msg)) => return encode_worker_error(code, msg),
             };
-            let mut buf = vec![0u8; 512 * 1024];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut ok = true;
-            builder
-                .write_get_repository(|resp| {
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_repository(|resp| {
                     ok = inspection.encode_into(resp);
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if !ok {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(Some(worker_request::Command::GetTree(gt))) => {
             let inspection = match inspect_tree(
@@ -985,23 +979,13 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 Ok(v) => v,
                 Err((code, msg)) => return encode_worker_error(code, msg),
             };
-            let mut buf = vec![0u8; 512 * 1024];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut ok = true;
-            builder
-                .write_get_tree(|resp| {
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_tree(|resp| {
                     ok = inspection.encode_into(resp);
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if !ok {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(Some(worker_request::Command::GetBlob(gb))) => {
             let inspection = match inspect_blob(
@@ -1018,23 +1002,13 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 Ok(v) => v,
                 Err((code, msg)) => return encode_worker_error(code, msg),
             };
-            let mut buf = vec![0u8; 512 * 1024];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut ok = true;
-            builder
-                .write_get_blob(|resp| {
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_blob(|resp| {
                     ok = inspection.encode_into(resp);
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if !ok {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(Some(worker_request::Command::ListCommits(lc))) => {
             let inspection = match inspect_commits(
@@ -1053,23 +1027,13 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 Ok(v) => v,
                 Err((code, msg)) => return encode_worker_error(code, msg),
             };
-            let mut buf = vec![0u8; 512 * 1024];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut ok = true;
-            builder
-                .write_list_commits(|resp| {
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_list_commits(|resp| {
                     ok = inspection.encode_into(resp);
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if !ok {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(Some(worker_request::Command::GetCommit(gc))) => {
             let inspection = match inspect_commit(
@@ -1085,23 +1049,13 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 Ok(v) => v,
                 Err((code, msg)) => return encode_worker_error(code, msg),
             };
-            let mut buf = vec![0u8; 512 * 1024];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut ok = true;
-            builder
-                .write_get_commit(|resp| {
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_commit(|resp| {
                     ok = inspection.encode_into(resp);
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if !ok {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
         Ok(None) => encode_worker_error(GrpcCode::InvalidArgument, "missing worker command"),
         Err(_) => encode_worker_error(GrpcCode::InvalidArgument, "invalid worker command oneof"),
@@ -1927,21 +1881,7 @@ fn encode_list_repositories_json(view: ListRepositoriesResponseView<'_>) -> Vec<
             json.push(',');
         }
         first = false;
-        json.push_str("{\"scope\":");
-        push_json_escaped(&mut json, item.scope().unwrap_or(""));
-        json.push_str(",\"owner\":");
-        push_json_escaped(&mut json, item.owner().unwrap_or(""));
-        json.push_str(",\"visibility\":");
-        push_json_escaped(&mut json, item.visibility().unwrap_or(""));
-        json.push_str(",\"name\":");
-        push_json_escaped(&mut json, item.name().unwrap_or(""));
-        json.push_str(",\"canonical_path\":");
-        push_json_escaped(&mut json, item.canonical_path().unwrap_or(""));
-        json.push_str(",\"ssh_url\":");
-        push_json_escaped(&mut json, item.ssh_url().unwrap_or(""));
-        json.push_str(",\"clone_command\":");
-        push_json_escaped(&mut json, item.clone_command().unwrap_or(""));
-        json.push('}');
+        push_repository_info_json(&mut json, item);
     }
     json.push_str("],\"authenticated_user\":");
     push_json_escaped(&mut json, auth_user);
@@ -2069,6 +2009,34 @@ fn wants_json(accept: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn finish_h1_proto_or_json<'a, V, E1, E2>(
+    proto_res: Result<&'a [u8], E1>,
+    accept: Option<&str>,
+    omit_body: bool,
+    from_bytes: impl FnOnce(&'a [u8]) -> Result<V, E2>,
+    encode_json: impl FnOnce(V) -> Vec<u8>,
+) -> H1Response {
+    let Ok(proto_bytes) = proto_res else {
+        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
+    };
+    if wants_json(accept) {
+        if let Ok(view) = from_bytes(proto_bytes) {
+            return H1Response {
+                status_code: 200,
+                content_type: "application/json; charset=utf-8",
+                body: encode_json(view),
+                omit_body,
+            };
+        }
+    }
+    H1Response {
+        status_code: 200,
+        content_type: "application/x-protobuf",
+        body: proto_bytes.to_vec(),
+        omit_body,
+    }
+}
+
 fn handle_h1_auth_status(
     handler: &GitServiceHandler,
     req: &ParsedH1Request,
@@ -2084,25 +2052,13 @@ fn handle_h1_auth_status(
     if let Err(status) = handler.get_auth_status(&mut meta, req_view, &mut builder) {
         return H1Response::from_grpc_status(status, omit_body);
     }
-    let Ok(proto_bytes) = builder.finish() else {
-        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-    };
-    if wants_json(req.accept.as_deref()) {
-        if let Ok(view) = GetAuthStatusResponseView::from_bytes(proto_bytes) {
-            return H1Response {
-                status_code: 200,
-                content_type: "application/json; charset=utf-8",
-                body: encode_auth_status_json(view),
-                omit_body,
-            };
-        }
-    }
-    H1Response {
-        status_code: 200,
-        content_type: "application/x-protobuf",
-        body: proto_bytes.to_vec(),
+    finish_h1_proto_or_json(
+        builder.finish(),
+        req.accept.as_deref(),
         omit_body,
-    }
+        GetAuthStatusResponseView::from_bytes,
+        encode_auth_status_json,
+    )
 }
 
 fn handle_h1_list_repositories(
@@ -2155,25 +2111,13 @@ fn handle_h1_list_repositories(
     if let Err(status) = handler.list_repositories(&mut meta, req_view, &mut resp_builder) {
         return H1Response::from_grpc_status(status, omit_body);
     }
-    let Ok(proto_bytes) = resp_builder.finish() else {
-        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-    };
-    if wants_json(req.accept.as_deref()) {
-        if let Ok(view) = ListRepositoriesResponseView::from_bytes(proto_bytes) {
-            return H1Response {
-                status_code: 200,
-                content_type: "application/json; charset=utf-8",
-                body: encode_list_repositories_json(view),
-                omit_body,
-            };
-        }
-    }
-    H1Response {
-        status_code: 200,
-        content_type: "application/x-protobuf",
-        body: proto_bytes.to_vec(),
+    finish_h1_proto_or_json(
+        resp_builder.finish(),
+        req.accept.as_deref(),
         omit_body,
-    }
+        ListRepositoriesResponseView::from_bytes,
+        encode_list_repositories_json,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2292,7 +2236,15 @@ fn match_repo_sub_route(path: &str) -> Option<RepoSubRoute<'_>> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+fn parse_optional_u32_query_param(raw: Option<&str>) -> Option<u32> {
+    let Some(s) = raw.filter(|s| !s.is_empty()) else {
+        return Some(0);
+    };
+    let mut buf = [0u8; 64];
+    let decoded = percent_decode_str(s, &mut buf).ok()?;
+    decoded.parse::<u32>().ok()
+}
+
 fn handle_h1_repo_sub_route(
     handler: &GitServiceHandler,
     req: &ParsedH1Request,
@@ -2342,34 +2294,18 @@ fn handle_h1_repo_sub_route(
         return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
     };
 
-    let mut limit_val = 0u32;
-    if let Some(lim_str) = raw_limit.filter(|s| !s.is_empty()) {
-        let mut lim_buf = [0u8; 64];
-        let Ok(decoded) = percent_decode_str(lim_str, &mut lim_buf) else {
-            return H1Response::plain_error(400, "invalid limit parameter", omit_body);
-        };
-        let Ok(parsed) = decoded.parse::<u32>() else {
-            return H1Response::plain_error(400, "invalid limit parameter", omit_body);
-        };
-        limit_val = parsed;
-    }
-
-    let mut offset_val = 0u32;
-    if let Some(off_str) = raw_offset.filter(|s| !s.is_empty()) {
-        let mut off_buf = [0u8; 64];
-        let Ok(decoded) = percent_decode_str(off_str, &mut off_buf) else {
-            return H1Response::plain_error(400, "invalid offset parameter", omit_body);
-        };
-        let Ok(parsed) = decoded.parse::<u32>() else {
-            return H1Response::plain_error(400, "invalid offset parameter", omit_body);
-        };
-        offset_val = parsed;
-    }
+    let Some(limit_val) = parse_optional_u32_query_param(raw_limit) else {
+        return H1Response::plain_error(400, "invalid limit parameter", omit_body);
+    };
+    let Some(offset_val) = parse_optional_u32_query_param(raw_offset) else {
+        return H1Response::plain_error(400, "invalid offset parameter", omit_body);
+    };
 
     let mut ctx = build_rpc_context(req);
     let mut meta = ctx.metadata();
     let mut req_buf = [0u8; 2048];
     let mut resp_buf = vec![0u8; 512 * 1024];
+    let accept = req.accept.as_deref();
 
     match route {
         RepoSubRoute::GetRepository { .. } => {
@@ -2389,25 +2325,13 @@ fn handle_h1_repo_sub_route(
             if let Err(status) = handler.get_repository(&mut meta, req_view, &mut resp_builder) {
                 return H1Response::from_grpc_status(status, omit_body);
             }
-            let Ok(proto_bytes) = resp_builder.finish() else {
-                return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-            };
-            if wants_json(req.accept.as_deref()) {
-                if let Ok(view) = GetRepositoryResponseView::from_bytes(proto_bytes) {
-                    return H1Response {
-                        status_code: 200,
-                        content_type: "application/json; charset=utf-8",
-                        body: encode_get_repository_json(view),
-                        omit_body,
-                    };
-                }
-            }
-            H1Response {
-                status_code: 200,
-                content_type: "application/x-protobuf",
-                body: proto_bytes.to_vec(),
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
                 omit_body,
-            }
+                GetRepositoryResponseView::from_bytes,
+                encode_get_repository_json,
+            )
         }
         RepoSubRoute::GetTree { .. } => {
             let mut b = GetTreeRequestBuilder::new(&mut req_buf);
@@ -2427,25 +2351,13 @@ fn handle_h1_repo_sub_route(
             if let Err(status) = handler.get_tree(&mut meta, req_view, &mut resp_builder) {
                 return H1Response::from_grpc_status(status, omit_body);
             }
-            let Ok(proto_bytes) = resp_builder.finish() else {
-                return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-            };
-            if wants_json(req.accept.as_deref()) {
-                if let Ok(view) = GetTreeResponseView::from_bytes(proto_bytes) {
-                    return H1Response {
-                        status_code: 200,
-                        content_type: "application/json; charset=utf-8",
-                        body: encode_get_tree_json(view),
-                        omit_body,
-                    };
-                }
-            }
-            H1Response {
-                status_code: 200,
-                content_type: "application/x-protobuf",
-                body: proto_bytes.to_vec(),
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
                 omit_body,
-            }
+                GetTreeResponseView::from_bytes,
+                encode_get_tree_json,
+            )
         }
         RepoSubRoute::GetBlob { .. } => {
             let mut b = GetBlobRequestBuilder::new(&mut req_buf);
@@ -2465,25 +2377,13 @@ fn handle_h1_repo_sub_route(
             if let Err(status) = handler.get_blob(&mut meta, req_view, &mut resp_builder) {
                 return H1Response::from_grpc_status(status, omit_body);
             }
-            let Ok(proto_bytes) = resp_builder.finish() else {
-                return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-            };
-            if wants_json(req.accept.as_deref()) {
-                if let Ok(view) = GetBlobResponseView::from_bytes(proto_bytes) {
-                    return H1Response {
-                        status_code: 200,
-                        content_type: "application/json; charset=utf-8",
-                        body: encode_get_blob_json(view),
-                        omit_body,
-                    };
-                }
-            }
-            H1Response {
-                status_code: 200,
-                content_type: "application/x-protobuf",
-                body: proto_bytes.to_vec(),
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
                 omit_body,
-            }
+                GetBlobResponseView::from_bytes,
+                encode_get_blob_json,
+            )
         }
         RepoSubRoute::ListCommits { .. } => {
             let mut b = ListCommitsRequestBuilder::new(&mut req_buf);
@@ -2505,25 +2405,13 @@ fn handle_h1_repo_sub_route(
             if let Err(status) = handler.list_commits(&mut meta, req_view, &mut resp_builder) {
                 return H1Response::from_grpc_status(status, omit_body);
             }
-            let Ok(proto_bytes) = resp_builder.finish() else {
-                return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-            };
-            if wants_json(req.accept.as_deref()) {
-                if let Ok(view) = ListCommitsResponseView::from_bytes(proto_bytes) {
-                    return H1Response {
-                        status_code: 200,
-                        content_type: "application/json; charset=utf-8",
-                        body: encode_list_commits_json(view),
-                        omit_body,
-                    };
-                }
-            }
-            H1Response {
-                status_code: 200,
-                content_type: "application/x-protobuf",
-                body: proto_bytes.to_vec(),
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
                 omit_body,
-            }
+                ListCommitsResponseView::from_bytes,
+                encode_list_commits_json,
+            )
         }
         RepoSubRoute::GetCommit { .. } => {
             let mut b = GetCommitRequestBuilder::new(&mut req_buf);
@@ -2542,25 +2430,13 @@ fn handle_h1_repo_sub_route(
             if let Err(status) = handler.get_commit(&mut meta, req_view, &mut resp_builder) {
                 return H1Response::from_grpc_status(status, omit_body);
             }
-            let Ok(proto_bytes) = resp_builder.finish() else {
-                return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-            };
-            if wants_json(req.accept.as_deref()) {
-                if let Ok(view) = GetCommitResponseView::from_bytes(proto_bytes) {
-                    return H1Response {
-                        status_code: 200,
-                        content_type: "application/json; charset=utf-8",
-                        body: encode_get_commit_json(view),
-                        omit_body,
-                    };
-                }
-            }
-            H1Response {
-                status_code: 200,
-                content_type: "application/x-protobuf",
-                body: proto_bytes.to_vec(),
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
                 omit_body,
-            }
+                GetCommitResponseView::from_bytes,
+                encode_get_commit_json,
+            )
         }
     }
 }

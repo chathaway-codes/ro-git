@@ -14,7 +14,7 @@ use ro_git_proto::ro_git::v1::{
 };
 use ro_git_proto::{
     format_canonical_path, format_clone_command, format_ssh_url, is_valid_identifier,
-    is_valid_revision, is_valid_scope, is_valid_visibility, normalize_repo_path,
+    is_valid_oid, is_valid_revision, is_valid_scope, is_valid_visibility, normalize_repo_path,
     normalize_revision, normalize_ssh_host, strip_git_suffix, tree_kind_from_mode,
     DEFAULT_REVISION, DIFF_STATUS_ADDED, DIFF_STATUS_COPIED, DIFF_STATUS_DELETED,
     DIFF_STATUS_MODIFIED, DIFF_STATUS_RENAMED, DIFF_STATUS_TYPECHANGE, TREE_KIND_DIR,
@@ -286,7 +286,7 @@ fn resolve_object_oid(repo_dir: &Path, spec: &str) -> Option<String> {
         return None;
     }
     let s = std::str::from_utf8(&out.stdout).ok()?.trim();
-    if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if is_valid_oid(s) {
         Some(s.to_owned())
     } else {
         None
@@ -1105,15 +1105,7 @@ impl RepositoryInspection {
         resp.write_resolved_revision(&self.resolved_revision)
             .write_head_oid(&self.head_oid)
             .write_head_ref(&self.head_ref)
-            .write_repository(|r| {
-                r.write_clone_command(&self.repository.clone_command)
-                    .write_ssh_url(&self.repository.ssh_url)
-                    .write_canonical_path(&self.repository.canonical_path)
-                    .write_name(&self.repository.name)
-                    .write_visibility(&self.repository.visibility)
-                    .write_owner(&self.repository.owner)
-                    .write_scope(&self.repository.scope);
-            });
+            .write_repository(|r| self.repository.encode_into(r));
         resp.check().is_ok()
     }
 }
@@ -1378,7 +1370,10 @@ pub fn copy_get_commit_response(
     Ok(())
 }
 
-fn push_repository_info_json(out: &mut String, r: ro_git_proto::v1::RepositoryInfoView<'_>) {
+pub(crate) fn push_repository_info_json(
+    out: &mut String,
+    r: ro_git_proto::v1::RepositoryInfoView<'_>,
+) {
     out.push_str("{\"scope\":");
     crate::push_json_escaped(out, r.scope().unwrap_or(""));
     out.push_str(",\"owner\":");
@@ -1393,6 +1388,16 @@ fn push_repository_info_json(out: &mut String, r: ro_git_proto::v1::RepositoryIn
     crate::push_json_escaped(out, r.ssh_url().unwrap_or(""));
     out.push_str(",\"clone_command\":");
     crate::push_json_escaped(out, r.clone_command().unwrap_or(""));
+    out.push('}');
+}
+
+fn push_ref_info_json(out: &mut String, r: RefInfoView<'_>) {
+    out.push_str("{\"name\":");
+    crate::push_json_escaped(out, r.name().unwrap_or(""));
+    out.push_str(",\"full_name\":");
+    crate::push_json_escaped(out, r.full_name().unwrap_or(""));
+    out.push_str(",\"oid\":");
+    crate::push_json_escaped(out, r.oid().unwrap_or(""));
     out.push('}');
 }
 
@@ -1471,13 +1476,7 @@ pub fn encode_get_repository_json(view: GetRepositoryResponseView<'_>) -> Vec<u8
             json.push(',');
         }
         first = false;
-        json.push_str("{\"name\":");
-        crate::push_json_escaped(&mut json, b.name().unwrap_or(""));
-        json.push_str(",\"full_name\":");
-        crate::push_json_escaped(&mut json, b.full_name().unwrap_or(""));
-        json.push_str(",\"oid\":");
-        crate::push_json_escaped(&mut json, b.oid().unwrap_or(""));
-        json.push('}');
+        push_ref_info_json(&mut json, b);
     }
 
     json.push_str("],\"tags\":[");
@@ -1487,13 +1486,7 @@ pub fn encode_get_repository_json(view: GetRepositoryResponseView<'_>) -> Vec<u8
             json.push(',');
         }
         first = false;
-        json.push_str("{\"name\":");
-        crate::push_json_escaped(&mut json, t.name().unwrap_or(""));
-        json.push_str(",\"full_name\":");
-        crate::push_json_escaped(&mut json, t.full_name().unwrap_or(""));
-        json.push_str(",\"oid\":");
-        crate::push_json_escaped(&mut json, t.oid().unwrap_or(""));
-        json.push('}');
+        push_ref_info_json(&mut json, t);
     }
 
     json.push_str("],\"entries\":[");
