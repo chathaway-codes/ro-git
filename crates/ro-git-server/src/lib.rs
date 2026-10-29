@@ -2,6 +2,8 @@
 //! OpenSSH `SSHSIG` stateless token verification, user/team credential resolution,
 //! and privilege-separated `git-worker` IPC and repository discovery.
 
+#![deny(unsafe_code)]
+
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -17,12 +19,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ro_git_proto::grpc::ro_git::v1::git_service::{GitService, GitServiceServer};
 use ro_git_proto::ro_git::v1::{
     worker_request, worker_response, GetAuthStatusRequestView, GetAuthStatusResponseBuilder,
-    GetAuthStatusResponseView, GetBlobRequestView, GetBlobResponseBuilder, GetCommitRequestView,
-    GetCommitResponseBuilder, GetRepositoryRequestView, GetRepositoryResponseBuilder,
-    GetTreeRequestView, GetTreeResponseBuilder, ListCommitsRequestView,
-    ListCommitsResponseBuilder, ListRepositoriesRequestBuilder, ListRepositoriesRequestView,
-    ListRepositoriesResponseBuilder, ListRepositoriesResponseView, WorkerRequestBuilder,
-    WorkerRequestView, WorkerResponseBuilder, WorkerResponseView,
+    GetAuthStatusResponseView, GetBlobRequestBuilder, GetBlobRequestView, GetBlobResponseBuilder,
+    GetBlobResponseView, GetCommitRequestBuilder, GetCommitRequestView, GetCommitResponseBuilder,
+    GetCommitResponseView, GetRepositoryRequestBuilder, GetRepositoryRequestView,
+    GetRepositoryResponseBuilder, GetRepositoryResponseView, GetTreeRequestBuilder,
+    GetTreeRequestView, GetTreeResponseBuilder, GetTreeResponseView, ListCommitsRequestBuilder,
+    ListCommitsRequestView, ListCommitsResponseBuilder, ListCommitsResponseView,
+    ListRepositoriesRequestBuilder, ListRepositoriesRequestView, ListRepositoriesResponseBuilder,
+    ListRepositoriesResponseView, RepositoryInfoBuilder, WorkerRequestBuilder, WorkerRequestView,
+    WorkerResponseBuilder, WorkerResponseView,
 };
 use ro_git_proto::{
     decode_bearer_token, format_canonical_path, format_clone_command, format_ssh_url,
@@ -39,6 +44,9 @@ use roto_grpc::{
     DynamicMetadata, GrpcCode, GrpcServer, GrpcService, GrpcStatus, Route, RpcContext, RpcMetadata,
 };
 use ssh_key::{PublicKey, SshSig};
+
+pub mod git_reader;
+pub use git_reader::*;
 
 /// Server configuration resolved from environment variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +180,18 @@ pub struct DiscoveredRepository {
     pub canonical_path: String,
     pub ssh_url: String,
     pub clone_command: String,
+}
+
+impl DiscoveredRepository {
+    pub(crate) fn encode_into(&self, r: &mut RepositoryInfoBuilder<'_>) {
+        r.write_clone_command(&self.clone_command)
+            .write_ssh_url(&self.ssh_url)
+            .write_canonical_path(&self.canonical_path)
+            .write_name(&self.name)
+            .write_visibility(&self.visibility)
+            .write_owner(&self.owner)
+            .write_scope(&self.scope);
+    }
 }
 
 /// Repository filter parameters for `ListRepositories`.
@@ -489,6 +509,7 @@ fn collect_filesystem_team_memberships(
     }
 }
 
+#[allow(unsafe_code)]
 fn resolve_or_fallback_dev_credentials(
     root_dir: &Path,
     etc_dir: Option<&Path>,
@@ -810,15 +831,30 @@ fn current_unix_secs() -> u64 {
 }
 
 fn encode_worker_error(code: GrpcCode, message: &str) -> Vec<u8> {
+    let bounded = truncate_utf8_str(message, 512);
     let mut buf = vec![0u8; 1024];
     let mut builder = WorkerResponseBuilder::new(&mut buf);
     builder
-        .write_error_message(message)
+        .write_error_message(&bounded)
         .write_status_code(code as u32);
-    builder
-        .finish()
-        .expect("worker error response fits in 1024-byte buffer")
-        .to_vec()
+    builder.finish().map(<[u8]>::to_vec).unwrap_or_default()
+}
+
+fn encode_worker_ok(
+    buf_size: usize,
+    write_payload: impl FnOnce(&mut WorkerResponseBuilder<'_>) -> bool,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; buf_size];
+    let mut builder = WorkerResponseBuilder::new(&mut buf);
+    let ok = write_payload(&mut builder);
+    builder.write_status_code(GrpcCode::Ok as u32);
+    if !ok {
+        return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
+    }
+    match builder.finish() {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted"),
+    }
 }
 
 /// Executes a serialized `WorkerRequest` inside the worker context and returns
@@ -870,24 +906,17 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
 
     match req_view.command() {
         Ok(Some(worker_request::Command::GetAuthStatus(_))) => {
-            let mut buf = vec![0u8; 2048];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            builder
-                .write_auth_status(|auth| {
+            encode_worker_ok(2048, |builder| {
+                builder.write_auth_status(|auth| {
                     auth.write_ssh_host(ssh_host);
                     if let Some(ref user) = creds.username {
                         auth.write_username(user).write_authenticated(true);
                     } else {
                         auth.write_username("").write_authenticated(false);
                     }
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                true
+            })
         }
         Ok(Some(worker_request::Command::ListRepositories(lr))) => {
             let filter = RepositoryFilter {
@@ -897,51 +926,138 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 query: lr.query().unwrap_or(""),
             };
             let repos = discover_repositories(root_dir, ssh_host, &creds, &filter);
-            let mut buf = vec![0u8; 65_536];
-            let mut builder = WorkerResponseBuilder::new(&mut buf);
-            let mut overflow = false;
-            builder
-                .write_list_repositories(|list_resp| {
+            encode_worker_ok(65_536, |builder| {
+                let mut ok = true;
+                builder.write_list_repositories(|list_resp| {
                     list_resp
                         .write_ssh_host(ssh_host)
                         .write_authenticated_user(creds.username.as_deref().unwrap_or(""));
                     for repo in repos.iter().rev() {
-                        list_resp.write_repositories(|r| {
-                            r.write_clone_command(&repo.clone_command)
-                                .write_ssh_url(&repo.ssh_url)
-                                .write_canonical_path(&repo.canonical_path)
-                                .write_name(&repo.name)
-                                .write_visibility(&repo.visibility)
-                                .write_owner(&repo.owner)
-                                .write_scope(&repo.scope);
-                        });
+                        list_resp.write_repositories(|r| repo.encode_into(r));
                         if list_resp.check().is_err() {
-                            overflow = true;
+                            ok = false;
                             break;
                         }
                     }
-                })
-                .write_status_code(GrpcCode::Ok as u32);
-            if overflow {
-                return encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted");
-            }
-            match builder.finish() {
-                Ok(bytes) => bytes.to_vec(),
-                Err(_) => {
-                    encode_worker_error(GrpcCode::ResourceExhausted, "worker buffer exhausted")
-                }
-            }
+                });
+                ok
+            })
         }
-        Ok(Some(
-            worker_request::Command::GetRepository(_)
-            | worker_request::Command::GetTree(_)
-            | worker_request::Command::GetBlob(_)
-            | worker_request::Command::ListCommits(_)
-            | worker_request::Command::GetCommit(_),
-        )) => encode_worker_error(
-            GrpcCode::Unimplemented,
-            "git object inspection command is not yet implemented",
-        ),
+        Ok(Some(worker_request::Command::GetRepository(gr))) => {
+            let inspection = match inspect_repository(
+                root_dir,
+                ssh_host,
+                &creds,
+                gr.scope().unwrap_or(""),
+                gr.owner().unwrap_or(""),
+                gr.visibility().unwrap_or(""),
+                gr.name().unwrap_or(""),
+                gr.revision().unwrap_or(""),
+            ) {
+                Ok(v) => v,
+                Err((code, msg)) => return encode_worker_error(code, msg),
+            };
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_repository(|resp| {
+                    ok = inspection.encode_into(resp);
+                });
+                ok
+            })
+        }
+        Ok(Some(worker_request::Command::GetTree(gt))) => {
+            let inspection = match inspect_tree(
+                root_dir,
+                ssh_host,
+                &creds,
+                gt.scope().unwrap_or(""),
+                gt.owner().unwrap_or(""),
+                gt.visibility().unwrap_or(""),
+                gt.name().unwrap_or(""),
+                gt.revision().unwrap_or(""),
+                gt.path().unwrap_or(""),
+            ) {
+                Ok(v) => v,
+                Err((code, msg)) => return encode_worker_error(code, msg),
+            };
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_tree(|resp| {
+                    ok = inspection.encode_into(resp);
+                });
+                ok
+            })
+        }
+        Ok(Some(worker_request::Command::GetBlob(gb))) => {
+            let inspection = match inspect_blob(
+                root_dir,
+                ssh_host,
+                &creds,
+                gb.scope().unwrap_or(""),
+                gb.owner().unwrap_or(""),
+                gb.visibility().unwrap_or(""),
+                gb.name().unwrap_or(""),
+                gb.revision().unwrap_or(""),
+                gb.path().unwrap_or(""),
+            ) {
+                Ok(v) => v,
+                Err((code, msg)) => return encode_worker_error(code, msg),
+            };
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_blob(|resp| {
+                    ok = inspection.encode_into(resp);
+                });
+                ok
+            })
+        }
+        Ok(Some(worker_request::Command::ListCommits(lc))) => {
+            let inspection = match inspect_commits(
+                root_dir,
+                ssh_host,
+                &creds,
+                lc.scope().unwrap_or(""),
+                lc.owner().unwrap_or(""),
+                lc.visibility().unwrap_or(""),
+                lc.name().unwrap_or(""),
+                lc.revision().unwrap_or(""),
+                lc.path().unwrap_or(""),
+                lc.limit().unwrap_or(0),
+                lc.offset().unwrap_or(0),
+            ) {
+                Ok(v) => v,
+                Err((code, msg)) => return encode_worker_error(code, msg),
+            };
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_list_commits(|resp| {
+                    ok = inspection.encode_into(resp);
+                });
+                ok
+            })
+        }
+        Ok(Some(worker_request::Command::GetCommit(gc))) => {
+            let inspection = match inspect_commit(
+                root_dir,
+                ssh_host,
+                &creds,
+                gc.scope().unwrap_or(""),
+                gc.owner().unwrap_or(""),
+                gc.visibility().unwrap_or(""),
+                gc.name().unwrap_or(""),
+                gc.revision().unwrap_or(""),
+            ) {
+                Ok(v) => v,
+                Err((code, msg)) => return encode_worker_error(code, msg),
+            };
+            encode_worker_ok(512 * 1024, |builder| {
+                let mut ok = true;
+                builder.write_get_commit(|resp| {
+                    ok = inspection.encode_into(resp);
+                });
+                ok
+            })
+        }
         Ok(None) => encode_worker_error(GrpcCode::InvalidArgument, "missing worker command"),
         Err(_) => encode_worker_error(GrpcCode::InvalidArgument, "invalid worker command oneof"),
     }
@@ -1003,6 +1119,7 @@ pub fn find_worker_binary() -> Option<PathBuf> {
 /// Spawns `ro-git-server git-worker` as a subprocess, dropping privileges to `creds`
 /// when running as `root` (`geteuid() == 0`), sending `req_bytes` over `stdin`, and
 /// returning the raw `WorkerResponse` bytes from `stdout`.
+#[allow(unsafe_code)]
 pub fn spawn_worker_subprocess(
     worker_bin: &Path,
     creds: &UserCredentials,
@@ -1310,7 +1427,7 @@ impl GitService for GitServiceHandler {
         &self,
         meta: &mut RpcMetadata<'_>,
         req: GetRepositoryRequestView<'a>,
-        _resp: &mut GetRepositoryResponseBuilder<'b>,
+        resp: &mut GetRepositoryResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
@@ -1318,7 +1435,7 @@ impl GitService for GitServiceHandler {
         let name = req.name().unwrap_or("");
         let revision = req.revision().unwrap_or("");
 
-        self.execute_worker_command(meta, |req_builder| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
             req_builder.write_get_repository(|gr| {
                 gr.write_revision(revision)
                     .write_name(name)
@@ -1327,14 +1444,24 @@ impl GitService for GitServiceHandler {
                     .write_scope(scope);
             });
         })?;
-        Err(GrpcStatus::unimplemented("unimplemented"))
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
+
+        match resp_view.result() {
+            Ok(Some(worker_response::Result::GetRepository(gr_view))) => {
+                copy_get_repository_response(gr_view, resp)
+            }
+            _ => Err(GrpcStatus::internal(
+                "missing GetRepository in WorkerResponse",
+            )),
+        }
     }
 
     fn get_tree<'a, 'b>(
         &self,
         meta: &mut RpcMetadata<'_>,
         req: GetTreeRequestView<'a>,
-        _resp: &mut GetTreeResponseBuilder<'b>,
+        resp: &mut GetTreeResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
@@ -1343,7 +1470,7 @@ impl GitService for GitServiceHandler {
         let revision = req.revision().unwrap_or("");
         let path = req.path().unwrap_or("");
 
-        self.execute_worker_command(meta, |req_builder| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
             req_builder.write_get_tree(|gt| {
                 gt.write_path(path)
                     .write_revision(revision)
@@ -1353,14 +1480,22 @@ impl GitService for GitServiceHandler {
                     .write_scope(scope);
             });
         })?;
-        Err(GrpcStatus::unimplemented("unimplemented"))
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
+
+        match resp_view.result() {
+            Ok(Some(worker_response::Result::GetTree(gt_view))) => {
+                copy_get_tree_response(gt_view, resp)
+            }
+            _ => Err(GrpcStatus::internal("missing GetTree in WorkerResponse")),
+        }
     }
 
     fn get_blob<'a, 'b>(
         &self,
         meta: &mut RpcMetadata<'_>,
         req: GetBlobRequestView<'a>,
-        _resp: &mut GetBlobResponseBuilder<'b>,
+        resp: &mut GetBlobResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
@@ -1369,7 +1504,7 @@ impl GitService for GitServiceHandler {
         let revision = req.revision().unwrap_or("");
         let path = req.path().unwrap_or("");
 
-        self.execute_worker_command(meta, |req_builder| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
             req_builder.write_get_blob(|gb| {
                 gb.write_path(path)
                     .write_revision(revision)
@@ -1379,14 +1514,22 @@ impl GitService for GitServiceHandler {
                     .write_scope(scope);
             });
         })?;
-        Err(GrpcStatus::unimplemented("unimplemented"))
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
+
+        match resp_view.result() {
+            Ok(Some(worker_response::Result::GetBlob(gb_view))) => {
+                copy_get_blob_response(gb_view, resp)
+            }
+            _ => Err(GrpcStatus::internal("missing GetBlob in WorkerResponse")),
+        }
     }
 
     fn list_commits<'a, 'b>(
         &self,
         meta: &mut RpcMetadata<'_>,
         req: ListCommitsRequestView<'a>,
-        _resp: &mut ListCommitsResponseBuilder<'b>,
+        resp: &mut ListCommitsResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
@@ -1397,7 +1540,7 @@ impl GitService for GitServiceHandler {
         let limit = req.limit().unwrap_or(0);
         let offset = req.offset().unwrap_or(0);
 
-        self.execute_worker_command(meta, |req_builder| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
             req_builder.write_list_commits(|lc| {
                 lc.write_offset(offset)
                     .write_limit(limit)
@@ -1409,14 +1552,24 @@ impl GitService for GitServiceHandler {
                     .write_scope(scope);
             });
         })?;
-        Err(GrpcStatus::unimplemented("unimplemented"))
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
+
+        match resp_view.result() {
+            Ok(Some(worker_response::Result::ListCommits(lc_view))) => {
+                copy_list_commits_response(lc_view, resp)
+            }
+            _ => Err(GrpcStatus::internal(
+                "missing ListCommits in WorkerResponse",
+            )),
+        }
     }
 
     fn get_commit<'a, 'b>(
         &self,
         meta: &mut RpcMetadata<'_>,
         req: GetCommitRequestView<'a>,
-        _resp: &mut GetCommitResponseBuilder<'b>,
+        resp: &mut GetCommitResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
@@ -1424,7 +1577,7 @@ impl GitService for GitServiceHandler {
         let name = req.name().unwrap_or("");
         let revision = req.revision().unwrap_or("");
 
-        self.execute_worker_command(meta, |req_builder| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
             req_builder.write_get_commit(|gc| {
                 gc.write_revision(revision)
                     .write_name(name)
@@ -1433,7 +1586,15 @@ impl GitService for GitServiceHandler {
                     .write_scope(scope);
             });
         })?;
-        Err(GrpcStatus::unimplemented("unimplemented"))
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
+
+        match resp_view.result() {
+            Ok(Some(worker_response::Result::GetCommit(gc_view))) => {
+                copy_get_commit_response(gc_view, resp)
+            }
+            _ => Err(GrpcStatus::internal("missing GetCommit in WorkerResponse")),
+        }
     }
 }
 
@@ -1722,21 +1883,7 @@ fn encode_list_repositories_json(view: ListRepositoriesResponseView<'_>) -> Vec<
             json.push(',');
         }
         first = false;
-        json.push_str("{\"scope\":");
-        push_json_escaped(&mut json, item.scope().unwrap_or(""));
-        json.push_str(",\"owner\":");
-        push_json_escaped(&mut json, item.owner().unwrap_or(""));
-        json.push_str(",\"visibility\":");
-        push_json_escaped(&mut json, item.visibility().unwrap_or(""));
-        json.push_str(",\"name\":");
-        push_json_escaped(&mut json, item.name().unwrap_or(""));
-        json.push_str(",\"canonical_path\":");
-        push_json_escaped(&mut json, item.canonical_path().unwrap_or(""));
-        json.push_str(",\"ssh_url\":");
-        push_json_escaped(&mut json, item.ssh_url().unwrap_or(""));
-        json.push_str(",\"clone_command\":");
-        push_json_escaped(&mut json, item.clone_command().unwrap_or(""));
-        json.push('}');
+        push_repository_info_json(&mut json, item);
     }
     json.push_str("],\"authenticated_user\":");
     push_json_escaped(&mut json, auth_user);
@@ -1864,6 +2011,34 @@ fn wants_json(accept: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn finish_h1_proto_or_json<'a, V, E1, E2>(
+    proto_res: Result<&'a [u8], E1>,
+    accept: Option<&str>,
+    omit_body: bool,
+    from_bytes: impl FnOnce(&'a [u8]) -> Result<V, E2>,
+    encode_json: impl FnOnce(V) -> Vec<u8>,
+) -> H1Response {
+    let Ok(proto_bytes) = proto_res else {
+        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
+    };
+    if wants_json(accept) {
+        if let Ok(view) = from_bytes(proto_bytes) {
+            return H1Response {
+                status_code: 200,
+                content_type: "application/json; charset=utf-8",
+                body: encode_json(view),
+                omit_body,
+            };
+        }
+    }
+    H1Response {
+        status_code: 200,
+        content_type: "application/x-protobuf",
+        body: proto_bytes.to_vec(),
+        omit_body,
+    }
+}
+
 fn handle_h1_auth_status(
     handler: &GitServiceHandler,
     req: &ParsedH1Request,
@@ -1879,25 +2054,13 @@ fn handle_h1_auth_status(
     if let Err(status) = handler.get_auth_status(&mut meta, req_view, &mut builder) {
         return H1Response::from_grpc_status(status, omit_body);
     }
-    let Ok(proto_bytes) = builder.finish() else {
-        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-    };
-    if wants_json(req.accept.as_deref()) {
-        if let Ok(view) = GetAuthStatusResponseView::from_bytes(proto_bytes) {
-            return H1Response {
-                status_code: 200,
-                content_type: "application/json; charset=utf-8",
-                body: encode_auth_status_json(view),
-                omit_body,
-            };
-        }
-    }
-    H1Response {
-        status_code: 200,
-        content_type: "application/x-protobuf",
-        body: proto_bytes.to_vec(),
+    finish_h1_proto_or_json(
+        builder.finish(),
+        req.accept.as_deref(),
         omit_body,
-    }
+        GetAuthStatusResponseView::from_bytes,
+        encode_auth_status_json,
+    )
 }
 
 fn handle_h1_list_repositories(
@@ -1950,24 +2113,333 @@ fn handle_h1_list_repositories(
     if let Err(status) = handler.list_repositories(&mut meta, req_view, &mut resp_builder) {
         return H1Response::from_grpc_status(status, omit_body);
     }
-    let Ok(proto_bytes) = resp_builder.finish() else {
-        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
-    };
-    if wants_json(req.accept.as_deref()) {
-        if let Ok(view) = ListRepositoriesResponseView::from_bytes(proto_bytes) {
-            return H1Response {
-                status_code: 200,
-                content_type: "application/json; charset=utf-8",
-                body: encode_list_repositories_json(view),
-                omit_body,
-            };
+    finish_h1_proto_or_json(
+        resp_builder.finish(),
+        req.accept.as_deref(),
+        omit_body,
+        ListRepositoriesResponseView::from_bytes,
+        encode_list_repositories_json,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoSubRoute<'a> {
+    GetRepository {
+        scope: &'a str,
+        owner: &'a str,
+        visibility: &'a str,
+        name: &'a str,
+    },
+    GetTree {
+        scope: &'a str,
+        owner: &'a str,
+        visibility: &'a str,
+        name: &'a str,
+    },
+    GetBlob {
+        scope: &'a str,
+        owner: &'a str,
+        visibility: &'a str,
+        name: &'a str,
+    },
+    ListCommits {
+        scope: &'a str,
+        owner: &'a str,
+        visibility: &'a str,
+        name: &'a str,
+    },
+    GetCommit {
+        scope: &'a str,
+        owner: &'a str,
+        visibility: &'a str,
+        name: &'a str,
+    },
+}
+
+impl<'a> RepoSubRoute<'a> {
+    const fn params(self) -> (&'a str, &'a str, &'a str, &'a str) {
+        match self {
+            Self::GetRepository {
+                scope,
+                owner,
+                visibility,
+                name,
+            }
+            | Self::GetTree {
+                scope,
+                owner,
+                visibility,
+                name,
+            }
+            | Self::GetBlob {
+                scope,
+                owner,
+                visibility,
+                name,
+            }
+            | Self::ListCommits {
+                scope,
+                owner,
+                visibility,
+                name,
+            }
+            | Self::GetCommit {
+                scope,
+                owner,
+                visibility,
+                name,
+            } => (scope, owner, visibility, name),
         }
     }
-    H1Response {
-        status_code: 200,
-        content_type: "application/x-protobuf",
-        body: proto_bytes.to_vec(),
-        omit_body,
+}
+
+fn match_repo_sub_route(path: &str) -> Option<RepoSubRoute<'_>> {
+    let rest = path.strip_prefix("/api/v1/repositories/")?;
+    let mut parts = rest.split('/');
+    let scope = parts.next().filter(|s| !s.is_empty())?;
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let visibility = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    match parts.next() {
+        None => Some(RepoSubRoute::GetRepository {
+            scope,
+            owner,
+            visibility,
+            name,
+        }),
+        Some(action) if parts.next().is_none() => match action {
+            "tree" => Some(RepoSubRoute::GetTree {
+                scope,
+                owner,
+                visibility,
+                name,
+            }),
+            "blob" => Some(RepoSubRoute::GetBlob {
+                scope,
+                owner,
+                visibility,
+                name,
+            }),
+            "commits" => Some(RepoSubRoute::ListCommits {
+                scope,
+                owner,
+                visibility,
+                name,
+            }),
+            "commit" => Some(RepoSubRoute::GetCommit {
+                scope,
+                owner,
+                visibility,
+                name,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_optional_u32_query_param(raw: Option<&str>) -> Option<u32> {
+    let Some(s) = raw.filter(|s| !s.is_empty()) else {
+        return Some(0);
+    };
+    let mut buf = [0u8; 64];
+    let decoded = percent_decode_str(s, &mut buf).ok()?;
+    decoded.parse::<u32>().ok()
+}
+
+fn handle_h1_repo_sub_route(
+    handler: &GitServiceHandler,
+    req: &ParsedH1Request,
+    route: RepoSubRoute<'_>,
+    omit_body: bool,
+) -> H1Response {
+    let (raw_scope, raw_owner, raw_vis, raw_name) = route.params();
+    let mut scope_buf = [0u8; 128];
+    let mut owner_buf = [0u8; 128];
+    let mut vis_buf = [0u8; 128];
+    let mut name_buf = [0u8; 128];
+
+    let Ok(scope) = percent_decode_str(raw_scope, &mut scope_buf) else {
+        return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
+    };
+    let Ok(owner) = percent_decode_str(raw_owner, &mut owner_buf) else {
+        return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
+    };
+    let Ok(visibility) = percent_decode_str(raw_vis, &mut vis_buf) else {
+        return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
+    };
+    let Ok(name) = percent_decode_str(raw_name, &mut name_buf) else {
+        return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
+    };
+
+    let mut raw_rev = "";
+    let mut raw_path = "";
+    let mut raw_limit: Option<&str> = None;
+    let mut raw_offset: Option<&str> = None;
+
+    for (k, v) in QueryIter::new(&req.query) {
+        match k {
+            "revision" => raw_rev = v,
+            "path" => raw_path = v,
+            "limit" => raw_limit = Some(v),
+            "offset" => raw_offset = Some(v),
+            _ => {}
+        }
+    }
+
+    let mut rev_buf = [0u8; 256];
+    let mut path_buf = [0u8; 1024];
+    let Ok(revision) = percent_decode_str(raw_rev, &mut rev_buf) else {
+        return H1Response::plain_error(400, "invalid revision parameter encoding", omit_body);
+    };
+    let Ok(path) = percent_decode_str(raw_path, &mut path_buf) else {
+        return H1Response::plain_error(400, "invalid path parameter encoding", omit_body);
+    };
+
+    let Some(limit_val) = parse_optional_u32_query_param(raw_limit) else {
+        return H1Response::plain_error(400, "invalid limit parameter", omit_body);
+    };
+    let Some(offset_val) = parse_optional_u32_query_param(raw_offset) else {
+        return H1Response::plain_error(400, "invalid offset parameter", omit_body);
+    };
+
+    let mut ctx = build_rpc_context(req);
+    let mut meta = ctx.metadata();
+    let mut req_buf = [0u8; 2048];
+    let mut resp_buf = vec![0u8; 512 * 1024];
+    let accept = req.accept.as_deref();
+
+    match route {
+        RepoSubRoute::GetRepository { .. } => {
+            let mut b = GetRepositoryRequestBuilder::new(&mut req_buf);
+            b.write_revision(revision)
+                .write_name(name)
+                .write_visibility(visibility)
+                .write_owner(owner)
+                .write_scope(scope);
+            let Ok(req_bytes) = b.finish() else {
+                return H1Response::plain_error(400, "request parameters too large", omit_body);
+            };
+            let Ok(req_view) = GetRepositoryRequestView::from_bytes(req_bytes) else {
+                return H1Response::plain_error(400, "invalid request", omit_body);
+            };
+            let mut resp_builder = GetRepositoryResponseBuilder::new(&mut resp_buf);
+            if let Err(status) = handler.get_repository(&mut meta, req_view, &mut resp_builder) {
+                return H1Response::from_grpc_status(status, omit_body);
+            }
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
+                omit_body,
+                GetRepositoryResponseView::from_bytes,
+                encode_get_repository_json,
+            )
+        }
+        RepoSubRoute::GetTree { .. } => {
+            let mut b = GetTreeRequestBuilder::new(&mut req_buf);
+            b.write_path(path)
+                .write_revision(revision)
+                .write_name(name)
+                .write_visibility(visibility)
+                .write_owner(owner)
+                .write_scope(scope);
+            let Ok(req_bytes) = b.finish() else {
+                return H1Response::plain_error(400, "request parameters too large", omit_body);
+            };
+            let Ok(req_view) = GetTreeRequestView::from_bytes(req_bytes) else {
+                return H1Response::plain_error(400, "invalid request", omit_body);
+            };
+            let mut resp_builder = GetTreeResponseBuilder::new(&mut resp_buf);
+            if let Err(status) = handler.get_tree(&mut meta, req_view, &mut resp_builder) {
+                return H1Response::from_grpc_status(status, omit_body);
+            }
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
+                omit_body,
+                GetTreeResponseView::from_bytes,
+                encode_get_tree_json,
+            )
+        }
+        RepoSubRoute::GetBlob { .. } => {
+            let mut b = GetBlobRequestBuilder::new(&mut req_buf);
+            b.write_path(path)
+                .write_revision(revision)
+                .write_name(name)
+                .write_visibility(visibility)
+                .write_owner(owner)
+                .write_scope(scope);
+            let Ok(req_bytes) = b.finish() else {
+                return H1Response::plain_error(400, "request parameters too large", omit_body);
+            };
+            let Ok(req_view) = GetBlobRequestView::from_bytes(req_bytes) else {
+                return H1Response::plain_error(400, "invalid request", omit_body);
+            };
+            let mut resp_builder = GetBlobResponseBuilder::new(&mut resp_buf);
+            if let Err(status) = handler.get_blob(&mut meta, req_view, &mut resp_builder) {
+                return H1Response::from_grpc_status(status, omit_body);
+            }
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
+                omit_body,
+                GetBlobResponseView::from_bytes,
+                encode_get_blob_json,
+            )
+        }
+        RepoSubRoute::ListCommits { .. } => {
+            let mut b = ListCommitsRequestBuilder::new(&mut req_buf);
+            b.write_offset(offset_val)
+                .write_limit(limit_val)
+                .write_path(path)
+                .write_revision(revision)
+                .write_name(name)
+                .write_visibility(visibility)
+                .write_owner(owner)
+                .write_scope(scope);
+            let Ok(req_bytes) = b.finish() else {
+                return H1Response::plain_error(400, "request parameters too large", omit_body);
+            };
+            let Ok(req_view) = ListCommitsRequestView::from_bytes(req_bytes) else {
+                return H1Response::plain_error(400, "invalid request", omit_body);
+            };
+            let mut resp_builder = ListCommitsResponseBuilder::new(&mut resp_buf);
+            if let Err(status) = handler.list_commits(&mut meta, req_view, &mut resp_builder) {
+                return H1Response::from_grpc_status(status, omit_body);
+            }
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
+                omit_body,
+                ListCommitsResponseView::from_bytes,
+                encode_list_commits_json,
+            )
+        }
+        RepoSubRoute::GetCommit { .. } => {
+            let mut b = GetCommitRequestBuilder::new(&mut req_buf);
+            b.write_revision(revision)
+                .write_name(name)
+                .write_visibility(visibility)
+                .write_owner(owner)
+                .write_scope(scope);
+            let Ok(req_bytes) = b.finish() else {
+                return H1Response::plain_error(400, "request parameters too large", omit_body);
+            };
+            let Ok(req_view) = GetCommitRequestView::from_bytes(req_bytes) else {
+                return H1Response::plain_error(400, "invalid request", omit_body);
+            };
+            let mut resp_builder = GetCommitResponseBuilder::new(&mut resp_buf);
+            if let Err(status) = handler.get_commit(&mut meta, req_view, &mut resp_builder) {
+                return H1Response::from_grpc_status(status, omit_body);
+            }
+            finish_h1_proto_or_json(
+                resp_builder.finish(),
+                accept,
+                omit_body,
+                GetCommitResponseView::from_bytes,
+                encode_get_commit_json,
+            )
+        }
     }
 }
 
@@ -1975,10 +2447,12 @@ fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> H1
     let is_head = req.method.eq_ignore_ascii_case("HEAD");
     let is_get = req.method.eq_ignore_ascii_case("GET");
 
-    if (req.path == "/api" || req.path.starts_with("/api/"))
-        && req.path != API_AUTH_STATUS_PATH
-        && req.path != API_REPOSITORIES_PATH
-    {
+    let repo_sub_route = match_repo_sub_route(&req.path);
+    let is_known_api = req.path == API_AUTH_STATUS_PATH
+        || req.path == API_REPOSITORIES_PATH
+        || repo_sub_route.is_some();
+
+    if (req.path == "/api" || req.path.starts_with("/api/")) && !is_known_api {
         return H1Response::plain_error(404, "not found", is_head);
     }
     if !is_get && !is_head {
@@ -1989,6 +2463,8 @@ fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> H1
         handle_h1_auth_status(handler, req, is_head)
     } else if req.path == API_REPOSITORIES_PATH {
         handle_h1_list_repositories(handler, req, is_head)
+    } else if let Some(route) = repo_sub_route {
+        handle_h1_repo_sub_route(handler, req, route, is_head)
     } else {
         let asset = serve_static_asset(Path::new(&handler.config.static_dir), &req.path);
         H1Response {
@@ -2158,8 +2634,8 @@ pub fn serve_tcp_stream(mut stream: TcpStream, config: ServerConfig) -> io::Resu
         let static_service = StaticAssetService::new(&config.static_dir);
         let git_service = GitServiceHandler::new(config).into_server();
         let routes: [&dyn Route; 2] = [&git_service, &static_service];
-        let mut msg_buf = vec![0u8; 128 * 1024];
-        let mut tx_buf = vec![0u8; 128 * 1024];
+        let mut msg_buf = vec![0u8; 512 * 1024];
+        let mut tx_buf = vec![0u8; 512 * 1024];
         let mut server =
             GrpcServer::<4, 4096, DynamicMetadata>::with_metadata_store(&routes, &mut msg_buf, &mut tx_buf);
         let _ = roto_grpc::serve_std_io(&mut server, io);
@@ -2814,8 +3290,440 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             let mut writer = BackwardWriter::new(&mut out_buf);
             let err = server
                 .call_unary(&mut meta, method, &[], &mut writer)
-                .expect_err("unimplemented object inspection RPC must return error");
-            assert_eq!(err.code, GrpcCode::Unimplemented, "method {method}");
+                .expect_err("empty object inspection RPC request must return InvalidArgument");
+            assert_eq!(err.code, GrpcCode::InvalidArgument, "method {method}");
         }
+    }
+
+    fn run_git_test_cmd(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Alice")
+            .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "Alice")
+            .env("GIT_COMMITTER_EMAIL", "alice@example.com")
+            .env("GIT_COMMITTER_DATE", "1700000100 +0000")
+            .output()
+            .expect("execute git command in test");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn inspects_bare_repositories_trees_blobs_commits_and_enforces_security_checks() {
+        let temp = TempRoot::new("git-reader");
+        let root = temp.path();
+
+        // 1. Provision an empty/unborn bare repository
+        let unborn_dir = root.join("users/alice/public/empty.git");
+        fs::create_dir_all(&unborn_dir).unwrap();
+        run_git_test_cmd(&unborn_dir, &["init", "--bare", "--initial-branch=main"]);
+
+        // 2. Provision a populated bare repository via a temporary working tree
+        let bare_dir = root.join("users/alice/public/project.git");
+        fs::create_dir_all(&bare_dir).unwrap();
+        run_git_test_cmd(&bare_dir, &["init", "--bare", "--initial-branch=main"]);
+
+        let priv_dir = root.join("users/alice/private/secret.git");
+        fs::create_dir_all(&priv_dir).unwrap();
+        run_git_test_cmd(&priv_dir, &["init", "--bare", "--initial-branch=main"]);
+
+        let work_dir = root.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+        run_git_test_cmd(&work_dir, &["init", "--initial-branch=main"]);
+        run_git_test_cmd(&work_dir, &["config", "user.name", "Alice"]);
+        run_git_test_cmd(&work_dir, &["config", "user.email", "alice@example.com"]);
+
+        fs::write(work_dir.join("README.md"), "# Project\nHello world\n").unwrap();
+        fs::create_dir_all(work_dir.join("src/nested")).unwrap();
+        fs::write(work_dir.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n")
+            .unwrap();
+        fs::write(work_dir.join("src/nested/mod.rs"), "// nested mod\n").unwrap();
+        fs::write(work_dir.join("assets.bin"), b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+        fs::write(work_dir.join("old_name.txt"), "rename me line 1\nrename me line 2\n").unwrap();
+        fs::write(work_dir.join("to_delete.txt"), "goodbye\n").unwrap();
+
+        run_git_test_cmd(&work_dir, &["add", "."]);
+        run_git_test_cmd(&work_dir, &["commit", "-m", "Initial commit\n\nDetailed body."]);
+        run_git_test_cmd(&work_dir, &["tag", "v0.1.0"]);
+
+        // Second commit: modify README.md, rename old_name.txt -> new_name.txt, delete to_delete.txt, add annotated tag
+        fs::write(
+            work_dir.join("README.md"),
+            "# Project\nHello world\nUpdated line\n",
+        )
+        .unwrap();
+        run_git_test_cmd(&work_dir, &["mv", "old_name.txt", "new_name.txt"]);
+        run_git_test_cmd(&work_dir, &["rm", "to_delete.txt"]);
+        run_git_test_cmd(&work_dir, &["add", "-A"]);
+        run_git_test_cmd(&work_dir, &["commit", "-m", "Second commit"]);
+        run_git_test_cmd(&work_dir, &["tag", "-a", "v1.0.0", "-m", "Release 1.0.0"]);
+        run_git_test_cmd(&work_dir, &["branch", "dev"]);
+
+        let bare_path_str = bare_dir.to_string_lossy().into_owned();
+        run_git_test_cmd(&work_dir, &["remote", "add", "origin", &bare_path_str]);
+        run_git_test_cmd(&work_dir, &["push", "origin", "main", "dev", "--tags"]);
+
+        let priv_path_str = priv_dir.to_string_lossy().into_owned();
+        run_git_test_cmd(&work_dir, &["remote", "add", "priv", &priv_path_str]);
+        run_git_test_cmd(&work_dir, &["push", "priv", "main"]);
+
+        let anon_creds = UserCredentials {
+            username: None,
+            uid: 65_534,
+            gid: 65_534,
+            supplementary_gids: Vec::new(),
+            team_names: Vec::new(),
+        };
+        let alice_creds = UserCredentials {
+            username: Some(String::from("alice")),
+            uid: 1001,
+            gid: 1001,
+            supplementary_gids: Vec::new(),
+            team_names: Vec::new(),
+        };
+
+        // 3. Test empty/unborn bare repository
+        let empty_repo = inspect_repository(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "empty",
+            "",
+        )
+        .expect("empty bare repo GetRepository must succeed");
+        assert_eq!(empty_repo.head_ref, "main");
+        assert_eq!(empty_repo.head_oid, "");
+        assert_eq!(empty_repo.resolved_revision, "");
+        assert!(empty_repo.branches.is_empty());
+        assert!(empty_repo.tags.is_empty());
+        assert!(empty_repo.entries.is_empty());
+
+        let empty_commits = inspect_commits(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "empty",
+            "",
+            "",
+            50,
+            0,
+        )
+        .expect("empty bare repo ListCommits with default revision must succeed");
+        assert!(empty_commits.commits.is_empty());
+        assert!(!empty_commits.has_more);
+
+        // Explicit revision on empty repo returns NotFound
+        assert_eq!(
+            inspect_repository(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "empty",
+                "main",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::NotFound
+        );
+
+        // 4. Test GetRepository on populated repo
+        let repo_insp = inspect_repository(
+            root,
+            "git.example.com",
+            &alice_creds,
+            "users",
+            "alice",
+            "public",
+            "project.git",
+            "",
+        )
+        .expect("inspect populated project repo");
+        assert_eq!(repo_insp.repository.name, "project");
+        assert_eq!(
+            repo_insp.repository.clone_command,
+            "git clone ssh://alice@git.example.com/users/alice/public/project.git"
+        );
+        assert_eq!(repo_insp.head_ref, "main");
+        assert_eq!(repo_insp.head_oid.len(), 40);
+        assert_eq!(repo_insp.resolved_revision, "main");
+        let branch_names: Vec<&str> = repo_insp.branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(branch_names, vec!["dev", "main"]);
+        let tag_names: Vec<&str> = repo_insp.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tag_names, vec!["v0.1.0", "v1.0.0"]);
+        // Annotated tag v1.0.0 must resolve to the target commit OID (head_oid)
+        assert_eq!(repo_insp.tags[1].oid, repo_insp.head_oid);
+        // Root entries must be sorted with directories first, then files by name
+        let entry_kinds_names: Vec<(&str, &str)> = repo_insp
+            .entries
+            .iter()
+            .map(|e| (e.kind.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(
+            entry_kinds_names,
+            vec![
+                ("dir", "src"),
+                ("file", "README.md"),
+                ("file", "assets.bin"),
+                ("file", "new_name.txt"),
+            ]
+        );
+
+        // 5. Test GetTree at nested subdirectory
+        let tree_insp = inspect_tree(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            "v1.0.0",
+            "src",
+        )
+        .expect("inspect src tree");
+        assert_eq!(tree_insp.revision, "v1.0.0");
+        assert_eq!(tree_insp.path, "src");
+        let src_entries: Vec<(&str, &str, &str)> = tree_insp
+            .entries
+            .iter()
+            .map(|e| (e.kind.as_str(), e.name.as_str(), e.path.as_str()))
+            .collect();
+        assert_eq!(
+            src_entries,
+            vec![
+                ("dir", "nested", "src/nested"),
+                ("file", "lib.rs", "src/lib.rs"),
+            ]
+        );
+
+        // Calling GetTree on a file path must return NotFound
+        assert_eq!(
+            inspect_tree(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "project",
+                "HEAD",
+                "README.md",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::NotFound
+        );
+
+        // 6. Test GetBlob for text and binary blobs
+        let text_blob = inspect_blob(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            "v0.1.0",
+            "README.md",
+        )
+        .expect("inspect text blob at v0.1.0");
+        assert!(!text_blob.is_binary);
+        assert!(!text_blob.truncated);
+        assert_eq!(text_blob.content, b"# Project\nHello world\n");
+
+        let bin_blob = inspect_blob(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            "HEAD",
+            "assets.bin",
+        )
+        .expect("inspect binary blob");
+        assert!(bin_blob.is_binary);
+        assert!(!bin_blob.truncated);
+        assert_eq!(bin_blob.content, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03");
+
+        // Calling GetBlob on a directory or empty path fails appropriately
+        assert_eq!(
+            inspect_blob(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "project",
+                "HEAD",
+                "src",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::NotFound
+        );
+        assert_eq!(
+            inspect_blob(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "project",
+                "HEAD",
+                "",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::InvalidArgument
+        );
+
+        // 7. Test ListCommits with pagination and path filter
+        let page1 = inspect_commits(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            "main",
+            "",
+            1,
+            0,
+        )
+        .expect("list commits page 1");
+        assert_eq!(page1.commits.len(), 1);
+        assert!(page1.has_more);
+        assert_eq!(page1.commits[0].subject, "Second commit");
+
+        let page2 = inspect_commits(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            "main",
+            "",
+            1,
+            1,
+        )
+        .expect("list commits page 2");
+        assert_eq!(page2.commits.len(), 1);
+        assert!(!page2.has_more);
+        assert_eq!(page2.commits[0].subject, "Initial commit");
+        assert_eq!(page2.commits[0].message, "Initial commit\n\nDetailed body.");
+
+        // 8. Test GetCommit diff statuses (modified, renamed, deleted)
+        let commit_detail = inspect_commit(
+            root,
+            "git.example.com",
+            &anon_creds,
+            "users",
+            "alice",
+            "public",
+            "project",
+            &page1.commits[0].oid,
+        )
+        .expect("inspect second commit");
+        assert_eq!(commit_detail.commit.subject, "Second commit");
+        assert_eq!(commit_detail.total_additions, 1);
+        assert_eq!(commit_detail.total_deletions, 1);
+        assert!(commit_detail.patch.contains("diff --git"));
+        let statuses: Vec<(&str, &str, &str)> = commit_detail
+            .files
+            .iter()
+            .map(|f| (f.status.as_str(), f.old_path.as_str(), f.path.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("modified", "", "README.md"),
+                ("renamed", "old_name.txt", "new_name.txt"),
+                ("deleted", "", "to_delete.txt"),
+            ]
+        );
+
+        // 9. Test private repository visibility access control & security rejections
+        assert_eq!(
+            inspect_repository(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "private",
+                "secret",
+                "",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::NotFound
+        );
+        assert!(inspect_repository(
+            root,
+            "git.example.com",
+            &alice_creds,
+            "users",
+            "alice",
+            "private",
+            "secret",
+            "",
+        )
+        .is_ok());
+
+        // Invalid revision (--flag injection) and path traversal must return InvalidArgument
+        assert_eq!(
+            inspect_repository(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "project",
+                "--output=/tmp/pwn",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::InvalidArgument
+        );
+        assert_eq!(
+            inspect_tree(
+                root,
+                "git.example.com",
+                &anon_creds,
+                "users",
+                "alice",
+                "public",
+                "project",
+                "HEAD",
+                "../secret",
+            )
+            .unwrap_err()
+            .0,
+            GrpcCode::InvalidArgument
+        );
     }
 }

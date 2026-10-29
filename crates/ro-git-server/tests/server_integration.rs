@@ -8,12 +8,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ro_git_proto::grpc::ro_git::v1::git_service::GitServiceClient;
 use ro_git_proto::ro_git::v1::{
-    GetAuthStatusRequestBuilder, GetAuthStatusResponseView, ListRepositoriesRequestBuilder,
-    ListRepositoriesResponseView,
+    GetAuthStatusRequestBuilder, GetAuthStatusResponseView, GetBlobRequestBuilder,
+    GetBlobResponseView, GetCommitRequestBuilder, GetCommitResponseView,
+    GetRepositoryRequestBuilder, GetRepositoryResponseView, GetTreeRequestBuilder,
+    GetTreeResponseView, ListCommitsRequestBuilder, ListCommitsResponseView,
+    ListRepositoriesRequestBuilder, ListRepositoriesResponseView,
 };
 use ro_git_proto::{
-    encode_bearer_token, format_token_payload, API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH,
-    SSH_SIG_NAMESPACE,
+    encode_bearer_token, format_blob_api_path, format_commit_api_path, format_commits_api_path,
+    format_repository_api_path, format_token_payload, format_tree_api_path, API_AUTH_STATUS_PATH,
+    API_REPOSITORIES_PATH, SSH_SIG_NAMESPACE,
 };
 use ro_git_server::{start_server, ServerConfig};
 use roto_grpc::{DynamicMetadata, GrpcClient, GrpcCode, StdClientTransport};
@@ -582,3 +586,380 @@ fn end_to_end_dev_user_fallback_over_grpc_and_http() {
 
     server.shutdown();
 }
+
+fn populate_bare_repo_fixture(bare_dir: &Path, work_dir: &Path) {
+    let _ = fs::remove_dir_all(bare_dir);
+    fs::create_dir_all(bare_dir).unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(bare_dir)
+        .args(["init", "--bare", "--initial-branch=main"])
+        .output()
+        .expect("git init --bare");
+    assert!(out.status.success());
+
+    let _ = fs::remove_dir_all(work_dir);
+    fs::create_dir_all(work_dir.join("src")).unwrap();
+    let run_git = |args: &[&str], date: &str| {
+        let out = std::process::Command::new("git")
+            .current_dir(work_dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Alice")
+            .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_NAME", "Alice")
+            .env("GIT_COMMITTER_EMAIL", "alice@example.com")
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run_git(&["init", "--initial-branch=main"], "1700000000 +0000");
+    fs::write(work_dir.join("README.md"), "# ro-git\nInitial docs.\n").unwrap();
+    fs::write(work_dir.join("src/main.rs"), "fn main() {\n    println!(\"v1\");\n}\n").unwrap();
+    fs::write(work_dir.join("logo.bin"), b"\x00\x01\x02\x03binary").unwrap();
+    fs::write(work_dir.join("legacy.txt"), "old content\n").unwrap();
+    run_git(&["add", "."], "1700000000 +0000");
+    run_git(&["commit", "-m", "Initial commit"], "1700000000 +0000");
+    run_git(&["tag", "v0.1.0"], "1700000000 +0000");
+
+    fs::write(
+        work_dir.join("README.md"),
+        "# ro-git\nInitial docs.\nSecond line.\n",
+    )
+    .unwrap();
+    run_git(&["mv", "legacy.txt", "renamed.txt"], "1700000100 +0000");
+    run_git(&["add", "-A"], "1700000100 +0000");
+    run_git(
+        &["commit", "-m", "Update README and rename file\n\nExtra details."],
+        "1700000100 +0000",
+    );
+    run_git(
+        &["tag", "-a", "v1.0.0", "-m", "Annotated v1.0.0"],
+        "1700000100 +0000",
+    );
+    run_git(&["branch", "feature-x"], "1700000100 +0000");
+
+    let bare_str = bare_dir.to_string_lossy().into_owned();
+    run_git(&["remote", "add", "origin", &bare_str], "1700000100 +0000");
+    run_git(
+        &["push", "origin", "main", "feature-x", "--tags"],
+        "1700000100 +0000",
+    );
+}
+
+#[test]
+fn end_to_end_object_inspection_over_grpc_and_http() {
+    let (root_dir, alice_priv) = setup_fixture_root();
+    let static_dir = setup_static_dir();
+    let root = root_dir.path();
+
+    // Populate `/teams/core/public/ro-git.git` and `/teams/core/private/roadmap.git`
+    let work_dir = TempDir::new("git-work");
+    populate_bare_repo_fixture(&root.join("teams/core/public/ro-git.git"), work_dir.path());
+    populate_bare_repo_fixture(
+        &root.join("teams/core/private/roadmap.git"),
+        work_dir.path(),
+    );
+
+    let server = start_server(ServerConfig {
+        listen_addr: String::from("127.0.0.1:0"),
+        root_dir: root.to_string_lossy().into_owned(),
+        ssh_host: String::from("git.example.com"),
+        static_dir: static_dir.path().to_string_lossy().into_owned(),
+        max_token_ttl_secs: 2_592_000,
+        nobody_uid: 65_534,
+        dev_user: None,
+    })
+    .expect("start_server");
+    let addr = server.local_addr();
+    let bearer_alice = make_bearer_token(&alice_priv, "alice", current_unix_secs() + 3_600);
+
+    // =========================================================================
+    // 1. gRPC Client tests for all 5 object inspection RPCs
+    // =========================================================================
+    let tcp = TcpStream::connect(addr).expect("connect gRPC TCP stream");
+    let _ = tcp.set_nodelay(true);
+    let mut tx_buf = vec![0u8; 256 * 1024];
+    let mut call_buf = vec![0u8; 256 * 1024];
+    let grpc_client = GrpcClient::<4, 16_384, DynamicMetadata>::with_metadata_store(
+        "http",
+        "git.example.com",
+        &mut tx_buf,
+    );
+    let transport = StdClientTransport::<TcpStream, 4, 16_384, 4096, DynamicMetadata>::with_metadata_store_and_io_buf(
+        tcp,
+        grpc_client,
+        &mut call_buf,
+    );
+    let mut client = GitServiceClient::new(transport);
+    let mut req_buf = [0u8; 512];
+
+    // 1a. Unborn / empty bare repository (`users/alice/public/dotfiles.git`)
+    let mut b = GetRepositoryRequestBuilder::new(&mut req_buf);
+    b.write_name("dotfiles")
+        .write_visibility("public")
+        .write_owner("alice")
+        .write_scope("users");
+    let unborn_view = client
+        .get_repository(b.finish().unwrap())
+        .expect("unborn repo GetRepository must succeed");
+    assert_eq!(unborn_view.head_ref().unwrap(), "main");
+    assert_eq!(unborn_view.head_oid().unwrap_or(""), "");
+    assert_eq!(unborn_view.resolved_revision().unwrap_or(""), "");
+    assert_eq!(unborn_view.branches().count(), 0);
+    assert_eq!(unborn_view.entries().count(), 0);
+
+    // 1b. Populated public repository (`teams/core/public/ro-git`)
+    let mut b = GetRepositoryRequestBuilder::new(&mut req_buf);
+    b.write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let repo_view = client
+        .get_repository(b.finish().unwrap())
+        .expect("GetRepository on ro-git");
+    assert_eq!(repo_view.head_ref().unwrap(), "main");
+    assert_eq!(repo_view.resolved_revision().unwrap(), "main");
+    let head_oid = repo_view.head_oid().unwrap().to_owned();
+    assert_eq!(head_oid.len(), 40);
+    let branches: Vec<String> = repo_view
+        .branches()
+        .map(|r| r.unwrap().name().unwrap().to_owned())
+        .collect();
+    assert_eq!(branches, vec!["feature-x", "main"]);
+    let tags: Vec<String> = repo_view
+        .tags()
+        .map(|t| t.unwrap().name().unwrap().to_owned())
+        .collect();
+    assert_eq!(tags, vec!["v0.1.0", "v1.0.0"]);
+    let root_entries: Vec<(String, String)> = repo_view
+        .entries()
+        .map(|e| {
+            let v = e.unwrap();
+            (v.kind().unwrap().to_owned(), v.name().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        root_entries,
+        vec![
+            (String::from("dir"), String::from("src")),
+            (String::from("file"), String::from("README.md")),
+            (String::from("file"), String::from("logo.bin")),
+            (String::from("file"), String::from("renamed.txt")),
+        ]
+    );
+
+    // 1c. GetTree on subdirectory `src`
+    let mut b = GetTreeRequestBuilder::new(&mut req_buf);
+    b.write_path("src")
+        .write_revision("v1.0.0")
+        .write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let tree_view = client
+        .get_tree(b.finish().unwrap())
+        .expect("GetTree on src");
+    assert_eq!(tree_view.path().unwrap(), "src");
+    let tree_files: Vec<String> = tree_view
+        .entries()
+        .map(|e| e.unwrap().path().unwrap().to_owned())
+        .collect();
+    assert_eq!(tree_files, vec!["src/main.rs"]);
+
+    // 1d. GetBlob on text and binary files
+    let mut b = GetBlobRequestBuilder::new(&mut req_buf);
+    b.write_path("src/main.rs")
+        .write_revision("main")
+        .write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let blob_view = client
+        .get_blob(b.finish().unwrap())
+        .expect("GetBlob on src/main.rs");
+    assert!(!blob_view.is_binary().unwrap());
+    assert_eq!(
+        blob_view.content().unwrap(),
+        b"fn main() {\n    println!(\"v1\");\n}\n"
+    );
+
+    let mut b = GetBlobRequestBuilder::new(&mut req_buf);
+    b.write_path("logo.bin")
+        .write_revision("main")
+        .write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let bin_view = client
+        .get_blob(b.finish().unwrap())
+        .expect("GetBlob on logo.bin");
+    assert!(bin_view.is_binary().unwrap());
+    assert_eq!(bin_view.content().unwrap(), b"\x00\x01\x02\x03binary");
+
+    // 1e. ListCommits and GetCommit
+    let mut b = ListCommitsRequestBuilder::new(&mut req_buf);
+    b.write_limit(1)
+        .write_revision("main")
+        .write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let commits_view = client
+        .list_commits(b.finish().unwrap())
+        .expect("ListCommits limit=1");
+    assert!(commits_view.has_more().unwrap());
+    let latest_commit = commits_view.commits().next().unwrap().unwrap();
+    assert_eq!(latest_commit.oid().unwrap(), head_oid);
+    assert_eq!(
+        latest_commit.subject().unwrap(),
+        "Update README and rename file"
+    );
+
+    let mut b = GetCommitRequestBuilder::new(&mut req_buf);
+    b.write_revision(&head_oid)
+        .write_name("ro-git")
+        .write_visibility("public")
+        .write_owner("core")
+        .write_scope("teams");
+    let commit_view = client
+        .get_commit(b.finish().unwrap())
+        .expect("GetCommit on head_oid");
+    assert_eq!(commit_view.total_additions().unwrap(), 1);
+    assert_eq!(commit_view.total_deletions().unwrap(), 0);
+    assert_eq!(commit_view.files().count(), 2);
+
+    // 1f. Private repository access control over gRPC
+    let mut b = GetRepositoryRequestBuilder::new(&mut req_buf);
+    b.write_name("roadmap")
+        .write_visibility("private")
+        .write_owner("core")
+        .write_scope("teams");
+    let priv_req_bytes = b.finish().unwrap();
+
+    // Anonymous caller gets NotFound
+    let err = client
+        .get_repository(priv_req_bytes)
+        .expect_err("anonymous caller must not access private repo");
+    assert_eq!(err.code, GrpcCode::NotFound);
+
+    // Non-member bob gets NotFound
+    client.insert_metadata("x-forwarded-user", "bob").unwrap();
+    let err = client
+        .get_repository(priv_req_bytes)
+        .expect_err("non-member bob must not access core private repo");
+    assert_eq!(err.code, GrpcCode::NotFound);
+
+    // Team member alice succeeds
+    client
+        .insert_metadata("authorization", &bearer_alice)
+        .unwrap();
+    let priv_view = client
+        .get_repository(priv_req_bytes)
+        .expect("team member alice accesses core private repo");
+    assert_eq!(
+        priv_view
+            .repository()
+            .unwrap()
+            .unwrap()
+            .clone_command()
+            .unwrap(),
+        "git clone ssh://alice@git.example.com/teams/core/private/roadmap.git"
+    );
+
+    drop(client);
+
+    // =========================================================================
+    // 2. HTTP/1.1 API tests for all 5 object inspection endpoints (Protobuf & JSON)
+    // =========================================================================
+    let repo_api = format_repository_api_path("teams", "core", "public", "ro-git");
+    let tree_api = format_tree_api_path("teams", "core", "public", "ro-git");
+    let blob_api = format_blob_api_path("teams", "core", "public", "ro-git");
+    let commits_api = format_commits_api_path("teams", "core", "public", "ro-git");
+    let commit_api = format_commit_api_path("teams", "core", "public", "ro-git");
+
+    // 2a. GetRepository HTTP/1.1 Protobuf & JSON
+    let resp = send_http1_request(addr, "GET", &repo_api, &[]);
+    assert_eq!(resp.status_code, 200);
+    let view = GetRepositoryResponseView::from_bytes(&resp.body).unwrap();
+    assert_eq!(view.head_ref().unwrap(), "main");
+
+    let json_resp = send_http1_request(addr, "GET", &repo_api, &[("Accept", "application/json")]);
+    assert_eq!(json_resp.status_code, 200);
+    let json_str = std::str::from_utf8(&json_resp.body).unwrap();
+    assert!(json_str.contains("\"head_ref\":\"main\""));
+    assert!(json_str.contains("\"branches\":["));
+
+    // 2b. GetTree HTTP/1.1 Protobuf & JSON
+    let tree_url = format!("{tree_api}?revision=main&path=src");
+    let resp = send_http1_request(addr, "GET", &tree_url, &[]);
+    assert_eq!(resp.status_code, 200);
+    let view = GetTreeResponseView::from_bytes(&resp.body).unwrap();
+    assert_eq!(view.path().unwrap(), "src");
+
+    let json_resp = send_http1_request(addr, "GET", &tree_url, &[("Accept", "application/json")]);
+    assert_eq!(json_resp.status_code, 200);
+    let json_str = std::str::from_utf8(&json_resp.body).unwrap();
+    assert!(json_str.contains("\"path\":\"src/main.rs\""));
+
+    // 2c. GetBlob HTTP/1.1 Protobuf & JSON
+    let blob_url = format!("{blob_api}?revision=v0.1.0&path=README.md");
+    let resp = send_http1_request(addr, "GET", &blob_url, &[]);
+    assert_eq!(resp.status_code, 200);
+    let view = GetBlobResponseView::from_bytes(&resp.body).unwrap();
+    assert_eq!(view.content().unwrap(), b"# ro-git\nInitial docs.\n");
+
+    let json_resp = send_http1_request(addr, "GET", &blob_url, &[("Accept", "application/json")]);
+    assert_eq!(json_resp.status_code, 200);
+    let json_str = std::str::from_utf8(&json_resp.body).unwrap();
+    assert!(json_str.contains("\"path\":\"README.md\""));
+
+    // 2d. ListCommits & GetCommit HTTP/1.1 Protobuf & JSON
+    let commits_url = format!("{commits_api}?revision=main&limit=1&offset=0");
+    let resp = send_http1_request(addr, "GET", &commits_url, &[]);
+    assert_eq!(resp.status_code, 200);
+    let view = ListCommitsResponseView::from_bytes(&resp.body).unwrap();
+    assert!(view.has_more().unwrap());
+
+    let json_resp =
+        send_http1_request(addr, "GET", &commits_url, &[("Accept", "application/json")]);
+    assert_eq!(json_resp.status_code, 200);
+    let json_str = std::str::from_utf8(&json_resp.body).unwrap();
+    assert!(json_str.contains("\"has_more\":true"));
+
+    let commit_url = format!("{commit_api}?revision={head_oid}");
+    let resp = send_http1_request(addr, "GET", &commit_url, &[]);
+    assert_eq!(resp.status_code, 200);
+    let view = GetCommitResponseView::from_bytes(&resp.body).unwrap();
+    assert_eq!(view.commit().unwrap().unwrap().oid().unwrap(), head_oid);
+
+    let json_resp = send_http1_request(addr, "GET", &commit_url, &[("Accept", "application/json")]);
+    assert_eq!(json_resp.status_code, 200);
+    let json_str = std::str::from_utf8(&json_resp.body).unwrap();
+    assert!(json_str.contains("\"status\":\"renamed\""));
+
+    // 2e. Private repo over HTTP/1.1 & invalid parameters (404 and 400)
+    let priv_api = format_repository_api_path("teams", "core", "private", "roadmap");
+    assert_eq!(send_http1_request(addr, "GET", &priv_api, &[]).status_code, 404);
+    assert_eq!(
+        send_http1_request(addr, "GET", &priv_api, &[("Authorization", &bearer_alice)]).status_code,
+        200
+    );
+    assert_eq!(
+        send_http1_request(addr, "GET", &format!("{tree_api}?revision=--bad"), &[]).status_code,
+        400
+    );
+    assert_eq!(
+        send_http1_request(addr, "GET", &format!("{blob_api}?path=../etc/passwd"), &[]).status_code,
+        400
+    );
+
+    server.shutdown();
+}
+
