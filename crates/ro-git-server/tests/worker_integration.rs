@@ -230,4 +230,185 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
             "/users/bob/public/tools.git",
         ]
     );
+
+    // 4. Populate `/teams/platform/private/deploy.git` and verify all 5 object reader commands via git-worker subprocess
+    let deploy_bare = root.join("teams/platform/private/deploy.git");
+    let _ = fs::remove_dir_all(&deploy_bare);
+    fs::create_dir_all(&deploy_bare).unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(&deploy_bare)
+        .args(["init", "--bare", "--initial-branch=main"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let work = root.join("deploy-work");
+    fs::create_dir_all(work.join("charts")).unwrap();
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&work)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Alice")
+            .env("GIT_AUTHOR_EMAIL", "alice@corp.local")
+            .env("GIT_AUTHOR_DATE", "1700001000 +0000")
+            .env("GIT_COMMITTER_NAME", "Alice")
+            .env("GIT_COMMITTER_EMAIL", "alice@corp.local")
+            .env("GIT_COMMITTER_DATE", "1700001000 +0000")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+    };
+    run_git(&["init", "--initial-branch=main"]);
+    fs::write(work.join("README.md"), "# Deploy\n").unwrap();
+    fs::write(work.join("charts/values.yaml"), "replicas: 3\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "Add deploy charts"]);
+    run_git(&["tag", "v1.0.0"]);
+    run_git(&["remote", "add", "origin", &deploy_bare.to_string_lossy()]);
+    run_git(&["push", "origin", "main", "--tags"]);
+
+    // 4a. GetRepository via git-worker subprocess
+    let mut req_buf = [0u8; 2048];
+    let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_get_repository(|gr| {
+            gr.write_revision("")
+                .write_name("deploy")
+                .write_visibility("private")
+                .write_owner("platform")
+                .write_scope("teams");
+        })
+        .write_now_unix_secs(now)
+        .write_max_token_ttl_secs(max_ttl)
+        .write_ssh_host("git.corp.local:2222")
+        .write_root_dir(&root.to_string_lossy())
+        .write_token(&token);
+    let resp_bytes =
+        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+    let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
+    assert_eq!(resp_view.status_code().unwrap(), 0);
+    let head_oid = match resp_view.result().unwrap() {
+        Some(worker_response::Result::GetRepository(gr)) => {
+            assert_eq!(gr.head_ref().unwrap(), "main");
+            assert_eq!(gr.resolved_revision().unwrap(), "main");
+            assert_eq!(gr.branches().count(), 1);
+            assert_eq!(gr.tags().count(), 1);
+            assert_eq!(gr.entries().count(), 2);
+            gr.head_oid().unwrap().to_owned()
+        }
+        other => panic!("expected GetRepository, got {other:?}"),
+    };
+
+    // 4b. GetTree via git-worker subprocess
+    let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_get_tree(|gt| {
+            gt.write_path("charts")
+                .write_revision("v1.0.0")
+                .write_name("deploy")
+                .write_visibility("private")
+                .write_owner("platform")
+                .write_scope("teams");
+        })
+        .write_now_unix_secs(now)
+        .write_max_token_ttl_secs(max_ttl)
+        .write_ssh_host("git.corp.local:2222")
+        .write_root_dir(&root.to_string_lossy())
+        .write_token(&token);
+    let resp_bytes =
+        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+    let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
+    assert_eq!(resp_view.status_code().unwrap(), 0);
+    match resp_view.result().unwrap() {
+        Some(worker_response::Result::GetTree(gt)) => {
+            assert_eq!(gt.path().unwrap(), "charts");
+            let entry = gt.entries().next().unwrap().unwrap();
+            assert_eq!(entry.name().unwrap(), "values.yaml");
+            assert_eq!(entry.path().unwrap(), "charts/values.yaml");
+        }
+        other => panic!("expected GetTree, got {other:?}"),
+    }
+
+    // 4c. GetBlob via git-worker subprocess
+    let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_get_blob(|gb| {
+            gb.write_path("charts/values.yaml")
+                .write_revision("main")
+                .write_name("deploy")
+                .write_visibility("private")
+                .write_owner("platform")
+                .write_scope("teams");
+        })
+        .write_now_unix_secs(now)
+        .write_max_token_ttl_secs(max_ttl)
+        .write_ssh_host("git.corp.local:2222")
+        .write_root_dir(&root.to_string_lossy())
+        .write_token(&token);
+    let resp_bytes =
+        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+    let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
+    assert_eq!(resp_view.status_code().unwrap(), 0);
+    match resp_view.result().unwrap() {
+        Some(worker_response::Result::GetBlob(gb)) => {
+            assert_eq!(gb.content().unwrap(), b"replicas: 3\n");
+            assert!(!gb.is_binary().unwrap());
+        }
+        other => panic!("expected GetBlob, got {other:?}"),
+    }
+
+    // 4d. ListCommits & GetCommit via git-worker subprocess
+    let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_list_commits(|lc| {
+            lc.write_limit(10)
+                .write_revision("main")
+                .write_name("deploy")
+                .write_visibility("private")
+                .write_owner("platform")
+                .write_scope("teams");
+        })
+        .write_now_unix_secs(now)
+        .write_max_token_ttl_secs(max_ttl)
+        .write_ssh_host("git.corp.local:2222")
+        .write_root_dir(&root.to_string_lossy())
+        .write_token(&token);
+    let resp_bytes =
+        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+    let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
+    assert_eq!(resp_view.status_code().unwrap(), 0);
+    match resp_view.result().unwrap() {
+        Some(worker_response::Result::ListCommits(lc)) => {
+            assert_eq!(lc.commits().count(), 1);
+            assert!(!lc.has_more().unwrap());
+        }
+        other => panic!("expected ListCommits, got {other:?}"),
+    }
+
+    let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_get_commit(|gc| {
+            gc.write_revision(&head_oid)
+                .write_name("deploy")
+                .write_visibility("private")
+                .write_owner("platform")
+                .write_scope("teams");
+        })
+        .write_now_unix_secs(now)
+        .write_max_token_ttl_secs(max_ttl)
+        .write_ssh_host("git.corp.local:2222")
+        .write_root_dir(&root.to_string_lossy())
+        .write_token(&token);
+    let resp_bytes =
+        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+    let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
+    assert_eq!(resp_view.status_code().unwrap(), 0);
+    match resp_view.result().unwrap() {
+        Some(worker_response::Result::GetCommit(gc)) => {
+            assert_eq!(gc.commit().unwrap().unwrap().oid().unwrap(), head_oid);
+            assert_eq!(gc.files().count(), 2);
+            assert_eq!(gc.total_additions().unwrap(), 2);
+        }
+        other => panic!("expected GetCommit, got {other:?}"),
+    }
 }
