@@ -1,4 +1,4 @@
-FROM archlinux:latest
+FROM archlinux:latest AS workspace
 
 # Step 1: Initialize keyring, update system packages, and install dependencies
 RUN pacman-key --init && \
@@ -66,3 +66,53 @@ RUN git config --global user.name "charles" && \
     git config --global user.email "charles@tipsy.codes"
 
 CMD ["/bin/bash"]
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build release server binary and Yew WASM frontend assets
+# ---------------------------------------------------------------------------
+FROM workspace AS builder
+
+USER root
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY proto ./proto
+COPY crates ./crates
+
+RUN cargo build --release --locked -p ro-git-server && \
+    trunk build --release --config crates/ro-git-ui/Trunk.toml --dist /build/dist
+
+# ---------------------------------------------------------------------------
+# Stage 3: Minimal production runtime (sshd + git-auto-shell + ro-git-server)
+# ---------------------------------------------------------------------------
+FROM archlinux:latest AS production
+
+RUN pacman-key --init && \
+    pacman-key --populate archlinux && \
+    pacman -Sy --noconfirm archlinux-keyring && \
+    pacman -Syu --noconfirm --overwrite '*' \
+        git \
+        openssh \
+        python \
+        openssl \
+        ca-certificates && \
+    pacman -Scc --noconfirm && \
+    install -dm0755 -o root -g root /users /teams /run/sshd /app/dist
+
+COPY --from=builder --chmod=0755 /build/target/release/ro-git-server /usr/local/bin/ro-git-server
+COPY --from=builder /build/dist /app/dist
+COPY --chmod=0755 scripts/git-auto-shell /usr/local/bin/git-auto-shell
+COPY --chmod=0755 scripts/git-sync-users /usr/local/bin/git-sync-users
+COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0644 config/sshd_config /etc/ssh/sshd_config
+
+ENV RO_GIT_LISTEN_ADDR=0.0.0.0:8080 \
+    RO_GIT_ROOT=/ \
+    RO_GIT_SSH_HOST=localhost \
+    RO_GIT_STATIC_DIR=/app/dist \
+    RO_GIT_MAX_TOKEN_TTL_SECS=2592000 \
+    RO_GIT_NOBODY_UID=65534
+
+EXPOSE 22 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
