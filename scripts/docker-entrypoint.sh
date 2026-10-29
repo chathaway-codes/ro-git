@@ -3,7 +3,7 @@ set -e
 
 GIT_SYNC_USERS_BIN="${GIT_SYNC_USERS_BIN:-/usr/local/bin/git-sync-users}"
 SSH_KEYGEN_BIN="${SSH_KEYGEN_BIN:-/usr/bin/ssh-keygen}"
-SSHD_BIN="${SSHD_BIN:-/usr/bin/sshd}"
+SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 RO_GIT_SERVER_BIN="${RO_GIT_SERVER_BIN:-/usr/local/bin/ro-git-server}"
 
 # Reconcile /users and /teams into /etc/passwd and /etc/group and enforce modes
