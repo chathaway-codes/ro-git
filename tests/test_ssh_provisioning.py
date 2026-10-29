@@ -399,9 +399,12 @@ class TestGitSyncUsers(unittest.TestCase):
 class TestProductionDockerAndEntrypoint(unittest.TestCase):
     def test_dockerfile_multi_stage_and_production_invariants(self):
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("FROM archlinux:latest AS workspace", dockerfile)
-        self.assertIn("FROM workspace AS builder", dockerfile)
-        self.assertIn("FROM archlinux:latest AS production", dockerfile)
+        self.assertIn("FROM debian:bookworm-slim AS toolchain", dockerfile)
+        self.assertIn("FROM toolchain AS workspace", dockerfile)
+        self.assertIn("FROM toolchain AS builder", dockerfile)
+        self.assertIn("FROM debian:bookworm-slim AS production", dockerfile)
+        self.assertIn("aarch64|arm64", dockerfile)
+        self.assertIn("x86_64|amd64", dockerfile)
         self.assertIn("cargo build --release --locked -p ro-git-server", dockerfile)
         self.assertIn("trunk build --release --config crates/ro-git-ui/Trunk.toml --dist /build/dist", dockerfile)
         self.assertIn("/usr/local/bin/ro-git-server", dockerfile)
@@ -411,6 +414,9 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
         self.assertIn("/etc/ssh/sshd_config", dockerfile)
         self.assertIn("EXPOSE 22 8080", dockerfile)
         self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]', dockerfile)
+
+        entrypoint_text = (REPO_ROOT / "scripts" / "docker-entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"', entrypoint_text)
 
     def test_docker_entrypoint_default_and_custom_command(self):
         entrypoint = REPO_ROOT / "scripts" / "docker-entrypoint.sh"

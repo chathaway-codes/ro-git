@@ -1,49 +1,75 @@
-FROM archlinux:latest AS workspace
+# ---------------------------------------------------------------------------
+# Stage 1: Multi-arch toolchain (linux/amd64 and linux/arm64)
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS toolchain
 
-# Step 1: Initialize keyring, update system packages, and install dependencies
-RUN pacman-key --init && \
-    pacman-key --populate archlinux && \
-    pacman -Sy --noconfirm archlinux-keyring && \
-    pacman -Syu --noconfirm --overwrite '*' \
-        base-devel \
-        git \
-        openssh \
-        python \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
         curl \
-        protobuf \
-        rustup \
-        pkgconf \
-        openssl \
-        trunk \
-        wasm-bindgen \
+        git \
+        openssh-client \
+        openssh-server \
+        python3 \
+        protobuf-compiler \
+        libprotobuf-dev \
+        pkg-config \
+        libssl-dev \
         binaryen && \
-    pacman -Scc --noconfirm
+    rm -rf /var/lib/apt/lists/*
 
-# Step 2: Install Rust toolchain, WASM target, and roto codegen plugins
 ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
-    PATH=/opt/cargo/bin:$PATH \
+    PATH=/opt/cargo/bin:/usr/local/bin:$PATH \
     PROTOC=/usr/bin/protoc \
     PROTOC_INCLUDE=/usr/include
 
+ARG TRUNK_VERSION="0.21.14"
+ARG WASM_BINDGEN_VERSION="0.2.128"
+
 RUN mkdir -p /opt/cargo /opt/rustup && \
-    rustup default stable && \
-    rustup component add rustfmt clippy && \
-    rustup target add wasm32-unknown-unknown && \
-    cargo install --git https://github.com/chathaway-codes/roto \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown && \
+    arch="$(uname -m)" && \
+    case "$arch" in \
+        aarch64|arm64) \
+            trunk_arch="aarch64-unknown-linux-gnu" && \
+            wbg_arch="aarch64-unknown-linux-gnu" \
+            ;; \
+        x86_64|amd64) \
+            trunk_arch="x86_64-unknown-linux-gnu" && \
+            wbg_arch="x86_64-unknown-linux-musl" \
+            ;; \
+        *) \
+            printf 'Unsupported architecture: %s\n' "$arch" >&2 && exit 1 \
+            ;; \
+    esac && \
+    curl -fSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${trunk_arch}.tar.gz" | \
+        tar -xz -C /usr/local/bin trunk && \
+    curl -fSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-${wbg_arch}.tar.gz" | \
+        tar -xz --strip-components=1 -C /usr/local/bin && \
+    chmod -R a+rwX /opt/rustup /opt/cargo
+
+# ---------------------------------------------------------------------------
+# Stage 2: Development workspace image (roto codegen + agy CLI + dev user)
+# ---------------------------------------------------------------------------
+FROM toolchain AS workspace
+
+RUN cargo install --git https://github.com/chathaway-codes/roto \
         cargo-roto \
         protoc-gen-roto \
         protoc-gen-roto-grpc && \
     chmod -R a+rwX /opt/rustup /opt/cargo
 
-# Step 3: Install Antigravity CLI (agy)
 ARG AGY_VERSION="1.2.16-5594158052802560"
-RUN curl -fSL "https://storage.googleapis.com/antigravity-public/antigravity-cli/${AGY_VERSION}/linux-x64/cli_linux_x64.tar.gz" | \
-    tar -xz -C /tmp && \
-    install -Dm755 /tmp/antigravity /usr/bin/agy && \
-    rm -f /tmp/antigravity
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        curl -fSL "https://storage.googleapis.com/antigravity-public/antigravity-cli/${AGY_VERSION}/linux-x64/cli_linux_x64.tar.gz" | \
+        tar -xz -C /tmp && \
+        install -Dm755 /tmp/antigravity /usr/bin/agy && \
+        rm -f /tmp/antigravity; \
+    fi
 
-# Step 4: Create non-root developer user matching default host UID/GID (1000)
 ARG USERNAME=developer
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -68,11 +94,10 @@ RUN git config --global user.name "charles" && \
 CMD ["/bin/bash"]
 
 # ---------------------------------------------------------------------------
-# Stage 2: Build release server binary and Yew WASM frontend assets
+# Stage 3: Build release server binary and Yew WASM frontend assets
 # ---------------------------------------------------------------------------
-FROM workspace AS builder
+FROM toolchain AS builder
 
-USER root
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
@@ -83,20 +108,18 @@ RUN cargo build --release --locked -p ro-git-server && \
     trunk build --release --config crates/ro-git-ui/Trunk.toml --dist /build/dist
 
 # ---------------------------------------------------------------------------
-# Stage 3: Minimal production runtime (sshd + git-auto-shell + ro-git-server)
+# Stage 4: Minimal production runtime (sshd + git-auto-shell + ro-git-server)
 # ---------------------------------------------------------------------------
-FROM archlinux:latest AS production
+FROM debian:bookworm-slim AS production
 
-RUN pacman-key --init && \
-    pacman-key --populate archlinux && \
-    pacman -Sy --noconfirm archlinux-keyring && \
-    pacman -Syu --noconfirm --overwrite '*' \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
         git \
-        openssh \
-        python \
-        openssl \
-        ca-certificates && \
-    pacman -Scc --noconfirm && \
+        openssh-server \
+        python3 \
+        libssl3 && \
+    rm -rf /var/lib/apt/lists/* && \
     install -dm0755 -o root -g root /users /teams /run/sshd /app/dist
 
 COPY --from=builder --chmod=0755 /build/target/release/ro-git-server /usr/local/bin/ro-git-server
