@@ -62,15 +62,17 @@ impl MarkdownContext {
     #[must_use]
     pub fn tree_route(&self, resolved_path: &str) -> String {
         let clean = resolved_path.trim_matches('/');
-        if clean.is_empty() {
+        let encoded_rev = crate::repo_browser::percent_encode_component(&self.revision);
+        let encoded_path = encode_route_path(clean);
+        if encoded_path.is_empty() {
             format!(
                 "/{}/{}/{}/{}/tree/{}",
-                self.scope, self.owner, self.visibility, self.repo, self.revision
+                self.scope, self.owner, self.visibility, self.repo, encoded_rev
             )
         } else {
             format!(
                 "/{}/{}/{}/{}/tree/{}/{}",
-                self.scope, self.owner, self.visibility, self.repo, self.revision, clean
+                self.scope, self.owner, self.visibility, self.repo, encoded_rev, encoded_path
             )
         }
     }
@@ -79,15 +81,31 @@ impl MarkdownContext {
     #[must_use]
     pub fn blob_route(&self, resolved_path: &str) -> String {
         let clean = resolved_path.trim_matches('/');
-        if clean.is_empty() {
+        let encoded_path = encode_route_path(clean);
+        if encoded_path.is_empty() {
             self.tree_route("")
         } else {
+            let encoded_rev = crate::repo_browser::percent_encode_component(&self.revision);
             format!(
                 "/{}/{}/{}/{}/blob/{}/{}",
-                self.scope, self.owner, self.visibility, self.repo, self.revision, clean
+                self.scope, self.owner, self.visibility, self.repo, encoded_rev, encoded_path
             )
         }
     }
+}
+
+#[must_use]
+fn encode_route_path(clean_path: &str) -> String {
+    clean_path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            let decoded = crate::repo_browser::percent_decode_component(seg)
+                .unwrap_or_else(|_| seg.to_owned());
+            crate::repo_browser::percent_encode_component(&decoded)
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Returns the [`pulldown_cmark::Options`] configured with CommonMark + GFM extensions
@@ -551,6 +569,8 @@ fn mark_enclosing_list_item_as_task(stack: &mut [Frame]) {
 ///   converting raw HTML tokens into literal [`VText`] nodes.
 /// - Filters unsafe URL schemes (`javascript:`, `data:`, `vbscript:`, `file:`, `//...`)
 ///   and rewrites relative repository links and images using `ctx`.
+#[allow(clippy::double_must_use)]
+#[must_use]
 pub fn render_markdown(markdown: &str, ctx: Option<&MarkdownContext>) -> Html {
     let parser = Parser::new_ext(markdown, markdown_options());
     let mut stack: Vec<Frame> = vec![Frame::Root {
@@ -758,10 +778,11 @@ pub fn render_markdown(markdown: &str, ctx: Option<&MarkdownContext>) -> Html {
                 }
                 _ => {
                     if stack.len() > 1 {
-                        let popped = stack.pop().expect("non-empty frame stack");
-                        let node = finish_frame(popped, ctx);
-                        if let Some(parent) = stack.last_mut() {
-                            parent.push_child(node);
+                        if let Some(popped) = stack.pop() {
+                            let node = finish_frame(popped, ctx);
+                            if let Some(parent) = stack.last_mut() {
+                                parent.push_child(node);
+                            }
                         }
                     }
                 }
@@ -826,10 +847,11 @@ pub fn render_markdown(markdown: &str, ctx: Option<&MarkdownContext>) -> Html {
     }
 
     while stack.len() > 1 {
-        let popped = stack.pop().expect("non-empty frame stack");
-        let node = finish_frame(popped, ctx);
-        if let Some(parent) = stack.last_mut() {
-            parent.push_child(node);
+        if let Some(popped) = stack.pop() {
+            let node = finish_frame(popped, ctx);
+            if let Some(parent) = stack.last_mut() {
+                parent.push_child(node);
+            }
         }
     }
 
@@ -989,6 +1011,15 @@ pub struct MarkdownProps {
 #[function_component(MarkdownView)]
 pub fn markdown_view(props: &MarkdownProps) -> Html {
     render_markdown(props.markdown.as_str(), props.context.as_ref())
+}
+
+impl MarkdownView {
+    /// Renders [`MarkdownProps`] directly into a [`VNode`] tree.
+    #[allow(clippy::double_must_use)]
+    #[must_use]
+    pub fn render(props: &MarkdownProps) -> Html {
+        render_markdown(props.markdown.as_str(), props.context.as_ref())
+    }
 }
 
 /// Serializes a Yew [`VNode`] tree into an HTML string for deterministic inspection
@@ -1436,6 +1467,49 @@ fn main() {
         assert_eq!(
             resolve_markdown_url("sub/dir/", Some(&nested_ctx), true),
             None
+        );
+
+        // Slash-containing revision (`feature/auth`) and pre-encoded `%20` path round-trip cleanly with `parse_app_route`
+        let slash_rev_ctx = MarkdownContext::new(
+            "users",
+            "alice",
+            "public",
+            "demo",
+            "feature/auth",
+            "docs",
+        );
+        let blob_href = resolve_markdown_url("./my%20guide.md", Some(&slash_rev_ctx), false).unwrap();
+        assert_eq!(
+            blob_href,
+            "/users/alice/public/demo/blob/feature%2Fauth/docs/my%20guide.md"
+        );
+        assert_eq!(
+            crate::repo_browser::parse_app_route(&blob_href),
+            Some(crate::repo_browser::AppRoute::Blob {
+                repo: crate::repo_browser::RepoCoordinates::new(
+                    "users", "alice", "public", "demo"
+                )
+                .unwrap(),
+                revision: "feature/auth".to_owned(),
+                path: "docs/my guide.md".to_owned(),
+            })
+        );
+
+        let tree_href = resolve_markdown_url("sub/", Some(&slash_rev_ctx), false).unwrap();
+        assert_eq!(
+            tree_href,
+            "/users/alice/public/demo/tree/feature%2Fauth/docs/sub"
+        );
+        assert_eq!(
+            crate::repo_browser::parse_app_route(&tree_href),
+            Some(crate::repo_browser::AppRoute::Tree {
+                repo: crate::repo_browser::RepoCoordinates::new(
+                    "users", "alice", "public", "demo"
+                )
+                .unwrap(),
+                revision: "feature/auth".to_owned(),
+                path: "docs/sub".to_owned(),
+            })
         );
     }
 

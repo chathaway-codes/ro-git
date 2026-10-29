@@ -1,21 +1,28 @@
 use crate::{
-    available_owners, build_bearer_token_from_signature, build_sign_in_challenge,
-    copy_button_label, decode_auth_status_response, decode_repositories_response,
-    filter_and_group_repositories, format_authorization_header, verify_auth_status_for_user,
-    AuthStatus, CopyTarget, RepoFilter, RepositoriesSnapshot, RepositoryGroup, RepositoryItem,
-    ScopeFilter, SignInChallenge, VisibilityFilter, DEFAULT_SSH_HOST, DEFAULT_TTL_SECS,
+    available_owners, build_bearer_token_from_signature, build_blob_api_url, build_commit_api_url,
+    build_commits_api_url, build_repository_api_url, build_sign_in_challenge, build_tree_api_url,
+    copy_button_label, decode_auth_status_response, decode_get_blob_response,
+    decode_get_commit_response, decode_get_repository_response, decode_get_tree_response,
+    decode_list_commits_response, decode_repositories_response, filter_and_group_repositories,
+    find_readme_entry, format_authorization_header, parse_app_route, render_blob_view,
+    render_commit_detail_view, render_commits_view, render_repository_header, render_tree_view,
+    verify_auth_status_for_user, AppRoute, AuthStatus, BlobViewMode, BlobViewModel,
+    CommitDetailModel, CommitListModel, CopyTarget, RepoFilter, RepositoriesSnapshot,
+    RepositoryGroup, RepositoryItem, RepositoryOverviewModel, ScopeFilter, SignInChallenge,
+    TreeViewModel, VisibilityFilter, COMMITS_PAGE_SIZE, DEFAULT_SSH_HOST, DEFAULT_TTL_SECS,
     LOCAL_STORAGE_TOKEN_KEY, TTL_OPTIONS,
 };
 use gloo_timers::callback::Timeout;
 use js_sys::{Date, Uint8Array};
-use ro_git_proto::{API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH};
+use ro_git_proto::{API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH, DEFAULT_REVISION};
 use std::cell::Cell;
 use std::rc::Rc;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
-    HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, Request, RequestInit, Response,
-    Storage,
+    HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, PopStateEvent, Request, RequestInit,
+    Response, Storage,
 };
 use yew::prelude::*;
 
@@ -55,6 +62,26 @@ fn copy_text_to_clipboard(text: String) {
     if let Some(window) = web_sys::window() {
         let clipboard = window.navigator().clipboard();
         let _ = clipboard.write_text(&text);
+    }
+}
+
+fn current_browser_route() -> AppRoute {
+    let Some(window) = web_sys::window() else {
+        return AppRoute::Index;
+    };
+    let location = window.location();
+    let pathname = location.pathname().unwrap_or_else(|_| "/".to_owned());
+    let search = location.search().unwrap_or_default();
+    let combined = format!("{pathname}{search}");
+    parse_app_route(&combined).unwrap_or(AppRoute::Index)
+}
+
+fn push_browser_route(route: &AppRoute) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(history) = window.history() {
+            let path = route.to_path();
+            let _ = history.push_state_with_url(&JsValue::NULL, "", Some(&path));
+        }
     }
 }
 
@@ -106,23 +133,107 @@ async fn fetch_repositories(token: Option<&str>) -> Result<RepositoriesSnapshot,
     decode_repositories_response(&bytes)
 }
 
+async fn fetch_repository_overview(
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+    revision: Option<&str>,
+    token: Option<&str>,
+) -> Result<RepositoryOverviewModel, String> {
+    let url = build_repository_api_url(scope, owner, visibility, name, revision);
+    let bytes = fetch_protobuf_bytes(&url, token).await?;
+    decode_get_repository_response(&bytes)
+}
+
+async fn fetch_tree_view(
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+    revision: &str,
+    path: &str,
+    token: Option<&str>,
+) -> Result<TreeViewModel, String> {
+    let url = build_tree_api_url(scope, owner, visibility, name, revision, path);
+    let bytes = fetch_protobuf_bytes(&url, token).await?;
+    decode_get_tree_response(&bytes)
+}
+
+async fn fetch_blob_view(
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+    revision: &str,
+    path: &str,
+    token: Option<&str>,
+) -> Result<BlobViewModel, String> {
+    let url = build_blob_api_url(scope, owner, visibility, name, revision, path);
+    let bytes = fetch_protobuf_bytes(&url, token).await?;
+    decode_get_blob_response(&bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_commit_list(
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+    revision: &str,
+    path: &str,
+    limit: u32,
+    offset: u32,
+    token: Option<&str>,
+) -> Result<CommitListModel, String> {
+    let url = build_commits_api_url(scope, owner, visibility, name, revision, path, limit, offset);
+    let bytes = fetch_protobuf_bytes(&url, token).await?;
+    decode_list_commits_response(&bytes)
+}
+
+async fn fetch_commit_detail(
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<CommitDetailModel, String> {
+    let url = build_commit_api_url(scope, owner, visibility, name, revision);
+    let bytes = fetch_protobuf_bytes(&url, token).await?;
+    decode_get_commit_response(&bytes)
+}
+
 fn render_header(
     auth_status: &AuthStatus,
     loading: bool,
+    on_navigate: &Callback<AppRoute>,
     on_refresh: Callback<MouseEvent>,
     on_open_sign_in: Callback<MouseEvent>,
     on_sign_out: Callback<MouseEvent>,
 ) -> Html {
+    let on_brand_click = {
+        let on_navigate = on_navigate.clone();
+        Callback::from(move |e: MouseEvent| {
+            if !e.ctrl_key() && !e.meta_key() && !e.shift_key() && !e.alt_key() && e.button() == 0 {
+                e.prevent_default();
+                on_navigate.emit(AppRoute::Index);
+            }
+        })
+    };
+
     html! {
         <header class="app-header">
             <div class="brand-block">
                 <div class="brand-title-row">
-                    <h1 class="brand-title">{ "ro-git" }</h1>
+                    <h1 class="brand-title">
+                        <a href="/" class="brand-link" onclick={on_brand_click}>{ "ro-git" }</a>
+                    </h1>
                     <span class="host-pill" title="Configured SSH host">
                         { format!("ssh://{}", auth_status.ssh_host) }
                     </span>
                 </div>
-                <p class="brand-subtitle">{ "Read-Only Git Repository Index" }</p>
+                <p class="brand-subtitle">{ "Read-Only Git Repository Browser" }</p>
             </div>
 
             <div class="auth-bar">
@@ -284,12 +395,15 @@ fn render_repo_card(
     auth_user: Option<&str>,
     copied_target: Option<&CopyTarget>,
     trigger_copy: &Callback<(String, CopyTarget)>,
+    on_navigate: &Callback<AppRoute>,
 ) -> Html {
     let scope_badge = repo.scope_badge();
     let vis_badge = repo.visibility_badge();
     let canonical = repo.canonical_path.clone();
     let clone_cmd = repo.clone_command_for(ssh_host, auth_user);
     let ssh_url = repo.ssh_url_for(ssh_host, auth_user);
+    let repo_href = repo.root_route();
+    let repo_coords = repo.coordinates();
 
     let clone_target = CopyTarget::CloneCommand(canonical.clone());
     let ssh_target = CopyTarget::SshUrl(canonical.clone());
@@ -316,11 +430,32 @@ fn render_repo_card(
         })
     };
 
+    let on_open_repo = {
+        let on_navigate = on_navigate.clone();
+        let repo_coords = repo_coords.clone();
+        Callback::from(move |e: MouseEvent| {
+            if !e.ctrl_key() && !e.meta_key() && !e.shift_key() && !e.alt_key() && e.button() == 0 {
+                if let Some(ref coords) = repo_coords {
+                    e.prevent_default();
+                    on_navigate.emit(AppRoute::RepoRoot {
+                        repo: coords.clone(),
+                    });
+                }
+            }
+        })
+    };
+
     html! {
         <article class="repo-card" key={canonical.clone()}>
             <div class="repo-card-main">
                 <div class="repo-title-row">
-                    <span class="repo-name">{ format!("{}.git", repo.name) }</span>
+                    <a
+                        href={repo_href.clone()}
+                        class="repo-name repo-name-link"
+                        onclick={on_open_repo.clone()}
+                    >
+                        { format!("{}.git", repo.name) }
+                    </a>
                     <span class={classes!("badge", format!("badge-scope-{scope_badge}"))}>
                         { scope_badge }
                     </span>
@@ -329,7 +464,13 @@ fn render_repo_card(
                     </span>
                 </div>
                 <div class="repo-canonical-path">
-                    <code>{ &canonical }</code>
+                    <a
+                        href={repo_href}
+                        class="repo-canonical-link"
+                        onclick={on_open_repo}
+                    >
+                        <code>{ &canonical }</code>
+                    </a>
                 </div>
                 <div class="repo-command-preview">
                     <code>{ &clone_cmd }</code>
@@ -364,6 +505,7 @@ fn render_repo_group(
     auth_user: Option<&str>,
     copied_target: Option<&CopyTarget>,
     trigger_copy: &Callback<(String, CopyTarget)>,
+    on_navigate: &Callback<AppRoute>,
 ) -> Html {
     let group_badge = group.scope_badge();
     let group_count = group.repositories.len();
@@ -388,7 +530,14 @@ fn render_repo_group(
 
             <div class="repo-list">
                 { for group.repositories.iter().map(|repo| {
-                    render_repo_card(repo, ssh_host, auth_user, copied_target, trigger_copy)
+                    render_repo_card(
+                        repo,
+                        ssh_host,
+                        auth_user,
+                        copied_target,
+                        trigger_copy,
+                        on_navigate,
+                    )
                 }) }
             </div>
         </div>
@@ -550,12 +699,22 @@ fn render_sign_in_modal(
 
 #[function_component(App)]
 pub fn app() -> Html {
+    let route = use_state(current_browser_route);
     let auth_status = use_state(AuthStatus::default);
     let repositories = use_state(Vec::<RepositoryItem>::new);
     let filter = use_state(RepoFilter::default);
     let loading = use_state(|| true);
     let load_error = use_state(|| Option::<String>::None);
     let refresh_seq = use_state(|| 0u32);
+
+    // Repository browser state
+    let repo_overview = use_state(|| Option::<RepositoryOverviewModel>::None);
+    let tree_view = use_state(|| Option::<TreeViewModel>::None);
+    let readme_blob = use_state(|| Option::<BlobViewModel>::None);
+    let blob_view = use_state(|| Option::<BlobViewModel>::None);
+    let blob_view_mode = use_state(BlobViewMode::default);
+    let commit_list = use_state(|| Option::<CommitListModel>::None);
+    let commit_detail = use_state(|| Option::<CommitDetailModel>::None);
 
     let copied_target = use_state(|| Option::<CopyTarget>::None);
 
@@ -568,18 +727,68 @@ pub fn app() -> Html {
     let modal_error = use_state(|| Option::<String>::None);
     let modal_verifying = use_state(|| false);
 
-    // Fetch auth status and repository index on mount and whenever `refresh_seq` changes.
+    // Register browser `popstate` listener for Back/Forward navigation.
     {
+        let route = route.clone();
+        let blob_view_mode = blob_view_mode.clone();
+        use_effect_with((), move |()| {
+            let maybe_listener = web_sys::window().map(|window| {
+                let cb = Closure::<dyn FnMut(PopStateEvent)>::new(move |_: PopStateEvent| {
+                    blob_view_mode.set(BlobViewMode::Rendered);
+                    route.set(current_browser_route());
+                });
+                let _ = window
+                    .add_event_listener_with_callback("popstate", cb.as_ref().unchecked_ref());
+                (window, cb)
+            });
+
+            move || {
+                if let Some((window, cb)) = maybe_listener {
+                    let _ = window.remove_event_listener_with_callback(
+                        "popstate",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+            }
+        });
+    }
+
+    // Fetch auth status and active route data on mount and whenever `(route, refresh_seq)` changes.
+    {
+        let active_route = (*route).clone();
+        let seq = *refresh_seq;
         let auth_status = auth_status.clone();
         let repositories = repositories.clone();
+        let repo_overview = repo_overview.clone();
+        let tree_view = tree_view.clone();
+        let readme_blob = readme_blob.clone();
+        let blob_view = blob_view.clone();
+        let commit_list = commit_list.clone();
+        let commit_detail = commit_detail.clone();
         let loading = loading.clone();
         let load_error = load_error.clone();
-        let seq = *refresh_seq;
 
-        use_effect_with(seq, move |_| {
+        use_effect_with((active_route, seq), move |(target_route, _)| {
             let cancelled = Rc::new(Cell::new(false));
             let cancelled_for_task = Rc::clone(&cancelled);
+            let target_route = target_route.clone();
             let mut current_auth = (*auth_status).clone();
+
+            let should_clear_overview = match (target_route.repo(), (*repo_overview).as_ref()) {
+                (Some(target_repo), Some(ov)) => {
+                    ov.repository.coordinates().as_ref() != Some(target_repo)
+                }
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if should_clear_overview {
+                repo_overview.set(None);
+                tree_view.set(None);
+                readme_blob.set(None);
+                blob_view.set(None);
+                commit_list.set(None);
+                commit_detail.set(None);
+            }
 
             loading.set(true);
             load_error.set(None);
@@ -610,24 +819,280 @@ pub fn app() -> Html {
                     }
                 };
 
-                match fetch_repositories(effective_token.as_deref()).await {
-                    Ok(snapshot) => {
-                        if cancelled_for_task.get() {
-                            return;
+                let token_ref = effective_token.as_deref();
+
+                match &target_route {
+                    AppRoute::Index => {
+                        match fetch_repositories(token_ref).await {
+                            Ok(snapshot) => {
+                                if cancelled_for_task.get() {
+                                    return;
+                                }
+                                if snapshot.ssh_host != DEFAULT_SSH_HOST
+                                    && current_auth.ssh_host != snapshot.ssh_host
+                                {
+                                    current_auth.ssh_host = snapshot.ssh_host.clone();
+                                    auth_status.set(current_auth);
+                                }
+                                repositories.set(snapshot.repositories);
+                            }
+                            Err(err) => {
+                                if cancelled_for_task.get() {
+                                    return;
+                                }
+                                load_error.set(Some(err));
+                            }
                         }
-                        if snapshot.ssh_host != DEFAULT_SSH_HOST
-                            && current_auth.ssh_host != snapshot.ssh_host
-                        {
-                            current_auth.ssh_host = snapshot.ssh_host.clone();
-                            auth_status.set(current_auth);
-                        }
-                        repositories.set(snapshot.repositories);
                     }
-                    Err(err) => {
-                        if cancelled_for_task.get() {
-                            return;
+                    AppRoute::RepoRoot { repo } => {
+                        tree_view.set(None);
+                        readme_blob.set(None);
+                        match fetch_repository_overview(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            None,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            Ok(ov) => {
+                                if cancelled_for_task.get() {
+                                    return;
+                                }
+                                let rev = ov.effective_revision().to_owned();
+                                let maybe_readme = find_readme_entry(&ov.entries).cloned();
+                                repo_overview.set(Some(ov));
+
+                                if let Some(readme_entry) = maybe_readme {
+                                    if let Ok(blob) = fetch_blob_view(
+                                        &repo.scope,
+                                        &repo.owner,
+                                        &repo.visibility,
+                                        &repo.name,
+                                        &rev,
+                                        &readme_entry.path,
+                                        token_ref,
+                                    )
+                                    .await
+                                    {
+                                        if !cancelled_for_task.get() {
+                                            readme_blob.set(Some(blob));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                if !cancelled_for_task.get() {
+                                    load_error.set(Some(err));
+                                }
+                            }
                         }
-                        load_error.set(Some(err));
+                    }
+                    AppRoute::Tree {
+                        repo,
+                        revision,
+                        path,
+                    } => {
+                        tree_view.set(None);
+                        readme_blob.set(None);
+                        if let Ok(ov) = fetch_repository_overview(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            Some(revision),
+                            token_ref,
+                        )
+                        .await
+                        {
+                            if cancelled_for_task.get() {
+                                return;
+                            }
+                            repo_overview.set(Some(ov));
+                        }
+
+                        match fetch_tree_view(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            revision,
+                            path,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            Ok(tv) => {
+                                if cancelled_for_task.get() {
+                                    return;
+                                }
+                                let rev = if tv.revision.is_empty() {
+                                    revision.clone()
+                                } else {
+                                    tv.revision.clone()
+                                };
+                                let maybe_readme = find_readme_entry(&tv.entries).cloned();
+                                tree_view.set(Some(tv));
+
+                                if let Some(readme_entry) = maybe_readme {
+                                    if let Ok(blob) = fetch_blob_view(
+                                        &repo.scope,
+                                        &repo.owner,
+                                        &repo.visibility,
+                                        &repo.name,
+                                        &rev,
+                                        &readme_entry.path,
+                                        token_ref,
+                                    )
+                                    .await
+                                    {
+                                        if !cancelled_for_task.get() {
+                                            readme_blob.set(Some(blob));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                if !cancelled_for_task.get() {
+                                    load_error.set(Some(err));
+                                }
+                            }
+                        }
+                    }
+                    AppRoute::Blob {
+                        repo,
+                        revision,
+                        path,
+                    } => {
+                        blob_view.set(None);
+                        if let Ok(ov) = fetch_repository_overview(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            Some(revision),
+                            token_ref,
+                        )
+                        .await
+                        {
+                            if cancelled_for_task.get() {
+                                return;
+                            }
+                            repo_overview.set(Some(ov));
+                        }
+
+                        match fetch_blob_view(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            revision,
+                            path,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            Ok(bv) => {
+                                if !cancelled_for_task.get() {
+                                    blob_view.set(Some(bv));
+                                }
+                            }
+                            Err(err) => {
+                                if !cancelled_for_task.get() {
+                                    load_error.set(Some(err));
+                                }
+                            }
+                        }
+                    }
+                    AppRoute::Commits {
+                        repo,
+                        revision,
+                        path,
+                        offset,
+                    } => {
+                        commit_list.set(None);
+                        if let Ok(ov) = fetch_repository_overview(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            Some(revision),
+                            token_ref,
+                        )
+                        .await
+                        {
+                            if cancelled_for_task.get() {
+                                return;
+                            }
+                            repo_overview.set(Some(ov));
+                        }
+
+                        match fetch_commit_list(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            revision,
+                            path,
+                            COMMITS_PAGE_SIZE,
+                            *offset,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            Ok(cl) => {
+                                if !cancelled_for_task.get() {
+                                    commit_list.set(Some(cl));
+                                }
+                            }
+                            Err(err) => {
+                                if !cancelled_for_task.get() {
+                                    load_error.set(Some(err));
+                                }
+                            }
+                        }
+                    }
+                    AppRoute::CommitDetail { repo, revision } => {
+                        commit_detail.set(None);
+                        if let Ok(ov) = fetch_repository_overview(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            None,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            if cancelled_for_task.get() {
+                                return;
+                            }
+                            repo_overview.set(Some(ov));
+                        }
+
+                        match fetch_commit_detail(
+                            &repo.scope,
+                            &repo.owner,
+                            &repo.visibility,
+                            &repo.name,
+                            revision,
+                            token_ref,
+                        )
+                        .await
+                        {
+                            Ok(cd) => {
+                                if !cancelled_for_task.get() {
+                                    commit_detail.set(Some(cd));
+                                }
+                            }
+                            Err(err) => {
+                                if !cancelled_for_task.get() {
+                                    load_error.set(Some(err));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -639,6 +1104,48 @@ pub fn app() -> Html {
             move || cancelled.set(true)
         });
     }
+
+    let on_navigate = {
+        let route = route.clone();
+        let blob_view_mode = blob_view_mode.clone();
+        Callback::from(move |next_route: AppRoute| {
+            push_browser_route(&next_route);
+            blob_view_mode.set(BlobViewMode::Rendered);
+            route.set(next_route);
+        })
+    };
+
+    let on_markdown_navigate = {
+        let on_navigate = on_navigate.clone();
+        Callback::from(move |raw_href: String| {
+            if let Some(parsed) = parse_app_route(&raw_href) {
+                on_navigate.emit(parsed);
+            }
+        })
+    };
+
+    let on_revision_change = {
+        let current_route = (*route).clone();
+        let on_navigate = on_navigate.clone();
+        Callback::from(move |e: Event| {
+            if let Some(select) = e
+                .target()
+                .and_then(|t| t.dyn_into::<HtmlSelectElement>().ok())
+            {
+                let next_rev = select.value();
+                if !next_rev.trim().is_empty() {
+                    on_navigate.emit(current_route.with_revision(&next_rev));
+                }
+            }
+        })
+    };
+
+    let on_blob_mode_change = {
+        let blob_view_mode = blob_view_mode.clone();
+        Callback::from(move |mode: BlobViewMode| {
+            blob_view_mode.set(mode);
+        })
+    };
 
     let trigger_copy = {
         let copied_target = copied_target.clone();
@@ -882,33 +1389,270 @@ pub fn app() -> Html {
         })
     };
 
-    let owners = available_owners(&repositories, filter.scope);
-    let groups = filter_and_group_repositories(&repositories, &filter);
-    let matched_count: usize = groups.iter().map(|g| g.repositories.len()).sum();
-    let total_count = repositories.len();
     let active_ssh_host = auth_status.ssh_host.clone();
     let active_user = auth_status.username.clone();
+
+    let main_body = match &*route {
+        AppRoute::Index => {
+            let owners = available_owners(&repositories, filter.scope);
+            let groups = filter_and_group_repositories(&repositories, &filter);
+            let matched_count: usize = groups.iter().map(|g| g.repositories.len()).sum();
+            let total_count = repositories.len();
+
+            html! {
+                <>
+                    { render_filter_bar(
+                        &filter,
+                        &owners,
+                        matched_count,
+                        total_count,
+                        on_query_input,
+                        on_scope_change,
+                        on_owner_change,
+                        on_visibility_change,
+                        on_clear_filters,
+                    ) }
+
+                    <section class="repo-index" aria-label="Repository Groups">
+                        if *loading && repositories.is_empty() {
+                            <div class="empty-state">
+                                <p>{ "Loading repository index..." }</p>
+                            </div>
+                        } else if groups.is_empty() {
+                            <div class="empty-state">
+                                if repositories.is_empty() {
+                                    <p>{ "No accessible repositories discovered on this server." }</p>
+                                    if !auth_status.authenticated {
+                                        <p class="empty-hint">
+                                            { "Sign in with your SSH key to unlock private user and team repositories." }
+                                        </p>
+                                    }
+                                } else {
+                                    <p>{ "No repositories match your active filters." }</p>
+                                }
+                            </div>
+                        } else {
+                            { for groups.iter().map(|group| {
+                                render_repo_group(
+                                    group,
+                                    &active_ssh_host,
+                                    active_user.as_deref(),
+                                    (*copied_target).as_ref(),
+                                    &trigger_copy,
+                                    &on_navigate,
+                                )
+                            }) }
+                        }
+                    </section>
+                </>
+            }
+        }
+        repo_route => {
+            let Some(repo) = repo_route.repo() else {
+                return html! {};
+            };
+            let overview_ref = (*repo_overview)
+                .as_ref()
+                .filter(|ov| ov.repository.coordinates().as_ref() == Some(repo));
+            let effective_rev = repo_route
+                .active_revision()
+                .or_else(|| overview_ref.map(RepositoryOverviewModel::effective_revision))
+                .unwrap_or(DEFAULT_REVISION);
+
+            let clone_cmd = overview_ref
+                .map(|ov| {
+                    ov.repository
+                        .clone_command_for(&active_ssh_host, active_user.as_deref())
+                })
+                .unwrap_or_else(|| {
+                    RepositoryItem::new(
+                        &active_ssh_host,
+                        active_user.as_deref(),
+                        &repo.scope,
+                        &repo.owner,
+                        &repo.visibility,
+                        &repo.name,
+                    )
+                    .clone_command
+                });
+
+            let sub_view = match repo_route {
+                AppRoute::RepoRoot { .. } => {
+                    if let Some(ov) = overview_ref {
+                        render_tree_view(
+                            repo,
+                            ov.effective_revision(),
+                            "",
+                            &ov.entries,
+                            ov.is_empty_unborn(),
+                            &clone_cmd,
+                            (*readme_blob).as_ref(),
+                            &on_navigate,
+                            on_markdown_navigate.clone(),
+                        )
+                    } else if *loading {
+                        html! {
+                            <div class="empty-state">
+                                <p>{ "Loading repository..." }</p>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+                AppRoute::Tree { revision, path, .. } => {
+                    if let Some(tv) = (*tree_view).as_ref() {
+                        let rev = if tv.revision.is_empty() {
+                            revision.as_str()
+                        } else {
+                            tv.revision.as_str()
+                        };
+                        let is_unborn = overview_ref
+                            .map(RepositoryOverviewModel::is_empty_unborn)
+                            .unwrap_or(false);
+                        render_tree_view(
+                            repo,
+                            rev,
+                            path,
+                            &tv.entries,
+                            is_unborn,
+                            &clone_cmd,
+                            (*readme_blob).as_ref(),
+                            &on_navigate,
+                            on_markdown_navigate.clone(),
+                        )
+                    } else if path.is_empty() {
+                        if let Some(ov) = overview_ref {
+                            render_tree_view(
+                                repo,
+                                revision,
+                                "",
+                                &ov.entries,
+                                ov.is_empty_unborn(),
+                                &clone_cmd,
+                                (*readme_blob).as_ref(),
+                                &on_navigate,
+                                on_markdown_navigate.clone(),
+                            )
+                        } else if *loading {
+                            html! {
+                                <div class="empty-state">
+                                    <p>{ "Loading directory tree..." }</p>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    } else if *loading {
+                        html! {
+                            <div class="empty-state">
+                                <p>{ "Loading directory tree..." }</p>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+                AppRoute::Blob { .. } => {
+                    if let Some(bv) = (*blob_view).as_ref() {
+                        let entry_mode = (*tree_view)
+                            .as_ref()
+                            .and_then(|tv| tv.entries.iter().find(|e| e.path == bv.path))
+                            .or_else(|| {
+                                overview_ref
+                                    .and_then(|ov| ov.entries.iter().find(|e| e.path == bv.path))
+                            })
+                            .map(|e| e.mode.as_str());
+                        render_blob_view(
+                            repo,
+                            bv,
+                            entry_mode,
+                            *blob_view_mode,
+                            on_blob_mode_change,
+                            &on_navigate,
+                            on_markdown_navigate,
+                        )
+                    } else if *loading {
+                        html! {
+                            <div class="empty-state">
+                                <p>{ "Loading blob..." }</p>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+                AppRoute::Commits {
+                    revision,
+                    path,
+                    offset,
+                    ..
+                } => {
+                    if let Some(cl) = (*commit_list).as_ref() {
+                        render_commits_view(
+                            repo,
+                            revision,
+                            path,
+                            *offset,
+                            COMMITS_PAGE_SIZE,
+                            cl,
+                            &on_navigate,
+                        )
+                    } else if *loading {
+                        html! {
+                            <div class="empty-state">
+                                <p>{ "Loading commit log..." }</p>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+                AppRoute::CommitDetail { .. } => {
+                    if let Some(cd) = (*commit_detail).as_ref() {
+                        render_commit_detail_view(repo, cd, &on_navigate)
+                    } else if *loading {
+                        html! {
+                            <div class="empty-state">
+                                <p>{ "Loading commit diff..." }</p>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+                AppRoute::Index => html! {},
+            };
+
+            html! {
+                <>
+                    { render_repository_header(
+                        repo,
+                        overview_ref,
+                        effective_rev,
+                        repo_route.is_commits_tab(),
+                        &active_ssh_host,
+                        active_user.as_deref(),
+                        (*copied_target).as_ref(),
+                        &trigger_copy,
+                        &on_navigate,
+                        on_revision_change,
+                    ) }
+                    { sub_view }
+                </>
+            }
+        }
+    };
 
     html! {
         <main class="ro-git-app">
             { render_header(
                 &auth_status,
                 *loading,
+                &on_navigate,
                 on_refresh.clone(),
                 on_open_sign_in,
                 on_sign_out,
-            ) }
-
-            { render_filter_bar(
-                &filter,
-                &owners,
-                matched_count,
-                total_count,
-                on_query_input,
-                on_scope_change,
-                on_owner_change,
-                on_visibility_change,
-                on_clear_filters,
             ) }
 
             if let Some(err) = (*load_error).clone() {
@@ -920,36 +1664,7 @@ pub fn app() -> Html {
                 </div>
             }
 
-            <section class="repo-index" aria-label="Repository Groups">
-                if *loading && repositories.is_empty() {
-                    <div class="empty-state">
-                        <p>{ "Loading repository index..." }</p>
-                    </div>
-                } else if groups.is_empty() {
-                    <div class="empty-state">
-                        if repositories.is_empty() {
-                            <p>{ "No accessible repositories discovered on this server." }</p>
-                            if !auth_status.authenticated {
-                                <p class="empty-hint">
-                                    { "Sign in with your SSH key to unlock private user and team repositories." }
-                                </p>
-                            }
-                        } else {
-                            <p>{ "No repositories match your active filters." }</p>
-                        }
-                    </div>
-                } else {
-                    { for groups.iter().map(|group| {
-                        render_repo_group(
-                            group,
-                            &active_ssh_host,
-                            active_user.as_deref(),
-                            (*copied_target).as_ref(),
-                            &trigger_copy,
-                        )
-                    }) }
-                }
-            </section>
+            { main_body }
 
             if *modal_open {
                 { render_sign_in_modal(
