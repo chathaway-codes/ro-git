@@ -1,7 +1,8 @@
-.PHONY: help test check test-issues test-ssh test-rust proto issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
+.PHONY: help test check test-issues test-ssh test-rust proto issues issues-ready issues-ui clean docker-build docker-prod docker-test docker-shell docker-yolo
 
 PROJECT_NAME ?= ro-git
 DOCKER_IMAGE ?= $(PROJECT_NAME)-workspace:latest
+PROD_IMAGE ?= $(PROJECT_NAME):latest
 CONTAINER_NAME ?= agy-ro-git
 DATA_VOLUME ?= agy-data-$(PROJECT_NAME)
 
@@ -41,7 +42,10 @@ clean: ## Clean generated test caches and temporary files
 	rm -rf __pycache__ tests/__pycache__ scripts/__pycache__ target dist
 
 docker-build: ## Build containerized development Docker image
-	docker build -t $(DOCKER_IMAGE) .
+	docker build --target workspace -t $(DOCKER_IMAGE) .
+
+docker-prod: ## Build production Docker image (sshd + git-auto-shell + ro-git-server + WASM UI)
+	docker build --target production -t $(PROD_IMAGE) .
 
 docker-test: ## Run test suite inside container
 	docker run --rm -v $(CURDIR):/workspace -w /workspace $(DOCKER_IMAGE) make test

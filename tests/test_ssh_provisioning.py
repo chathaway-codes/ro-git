@@ -396,5 +396,89 @@ class TestGitSyncUsers(unittest.TestCase):
         self.assertEqual((self.etc / "group").read_text(encoding="utf-8"), group_text)
 
 
+class TestProductionDockerAndEntrypoint(unittest.TestCase):
+    def test_dockerfile_multi_stage_and_production_invariants(self):
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("FROM archlinux:latest AS workspace", dockerfile)
+        self.assertIn("FROM workspace AS builder", dockerfile)
+        self.assertIn("FROM archlinux:latest AS production", dockerfile)
+        self.assertIn("cargo build --release --locked -p ro-git-server", dockerfile)
+        self.assertIn("trunk build --release --config crates/ro-git-ui/Trunk.toml --dist /build/dist", dockerfile)
+        self.assertIn("/usr/local/bin/ro-git-server", dockerfile)
+        self.assertIn("/usr/local/bin/git-auto-shell", dockerfile)
+        self.assertIn("/usr/local/bin/git-sync-users", dockerfile)
+        self.assertIn("/usr/local/bin/docker-entrypoint.sh", dockerfile)
+        self.assertIn("/etc/ssh/sshd_config", dockerfile)
+        self.assertIn("EXPOSE 22 8080", dockerfile)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]', dockerfile)
+
+    def test_docker_entrypoint_default_and_custom_command(self):
+        entrypoint = REPO_ROOT / "scripts" / "docker-entrypoint.sh"
+        self.assertTrue(os.access(entrypoint, os.X_OK))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            log_file = tmp_dir / "calls.log"
+
+            def make_stub(name: str) -> Path:
+                p = tmp_dir / name
+                p.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s:%s\\n' '{name}' \"$*\" >> '{log_file}'\n"
+                    "printf 'diag-%s\\n' '" + name + "'\n",
+                    encoding="utf-8",
+                )
+                p.chmod(0o755)
+                return p
+
+            sync_stub = make_stub("git-sync-users")
+            keygen_stub = make_stub("ssh-keygen")
+            sshd_stub = make_stub("sshd")
+            server_stub = tmp_dir / "ro-git-server"
+            server_stub.write_text(
+                "#!/bin/sh\n"
+                f"printf 'ro-git-server:%s\\n' \"$*\" >> '{log_file}'\n",
+                encoding="utf-8",
+            )
+            server_stub.chmod(0o755)
+
+            env = os.environ.copy()
+            env["GIT_SYNC_USERS_BIN"] = str(sync_stub)
+            env["SSH_KEYGEN_BIN"] = str(keygen_stub)
+            env["SSHD_BIN"] = str(sshd_stub)
+            env["RO_GIT_SERVER_BIN"] = str(server_stub)
+
+            res = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(
+                log_file.read_text(encoding="utf-8").splitlines(),
+                [
+                    "git-sync-users:",
+                    "ssh-keygen:-A",
+                    "sshd:-e",
+                    "ro-git-server:",
+                ],
+            )
+
+            # Verify custom command passthrough
+            log_file.unlink()
+            res_cmd = subprocess.run(
+                [str(entrypoint), "printf", "%s", "custom-ok"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_cmd.returncode, 0, res_cmd.stderr)
+            self.assertEqual(res_cmd.stdout, "custom-ok")
+            self.assertEqual(
+                log_file.read_text(encoding="utf-8").splitlines(),
+                [
+                    "git-sync-users:",
+                    "ssh-keygen:-A",
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
