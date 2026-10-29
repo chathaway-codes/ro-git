@@ -4,26 +4,37 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ro_git_proto::grpc::ro_git::v1::git_service::{GitService, GitServiceServer};
 use ro_git_proto::ro_git::v1::{
     worker_request, worker_response, GetAuthStatusRequestView, GetAuthStatusResponseBuilder,
-    ListRepositoriesRequestView, ListRepositoriesResponseBuilder, WorkerRequestBuilder,
+    GetAuthStatusResponseView, ListRepositoriesRequestBuilder, ListRepositoriesRequestView,
+    ListRepositoriesResponseBuilder, ListRepositoriesResponseView, WorkerRequestBuilder,
     WorkerRequestView, WorkerResponseBuilder, WorkerResponseView,
 };
 use ro_git_proto::{
     decode_bearer_token, format_canonical_path, format_clone_command, format_ssh_url,
     is_valid_identifier, is_valid_scope, is_valid_visibility, normalize_ssh_host,
-    validate_token_claims, TokenError, SCOPE_TEAMS, SCOPE_USERS, SSH_SIG_NAMESPACE,
-    VISIBILITY_PRIVATE, VISIBILITY_PUBLIC,
+    validate_token_claims, TokenError, API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH, SCOPE_TEAMS,
+    SCOPE_USERS, SSH_SIG_NAMESPACE, VISIBILITY_PRIVATE, VISIBILITY_PUBLIC,
 };
-use roto_grpc::{GrpcCode, GrpcStatus, RpcMetadata};
+use roto::runtime::BackwardWriter;
+use roto_grpc::http::{
+    finish_writer_response, http_reason_phrase, percent_decode_str, HttpMethod, HttpRequest,
+    HttpResponse, HttpService, QueryIter,
+};
+use roto_grpc::{
+    DynamicMetadata, GrpcCode, GrpcServer, GrpcService, GrpcStatus, Route, RpcContext, RpcMetadata,
+};
 use ssh_key::{PublicKey, SshSig};
 
 /// Server configuration resolved from environment variables.
@@ -1113,6 +1124,28 @@ impl GitServiceHandler {
             }
         }
 
+        for header_name in ["x-forwarded-user", "remote-user"] {
+            if let Some(raw_proxy_user) = meta.get(header_name) {
+                let proxy_user = std::str::from_utf8(raw_proxy_user)
+                    .map_err(|_| {
+                        GrpcStatus::unauthenticated("invalid proxy user header encoding")
+                    })?
+                    .trim();
+                if !proxy_user.is_empty() {
+                    let creds = resolve_or_fallback_dev_credentials(
+                        root_path,
+                        None,
+                        proxy_user,
+                        self.config.nobody_uid,
+                    )
+                    .map_err(|_| {
+                        GrpcStatus::unauthenticated("invalid proxy user header identifier")
+                    })?;
+                    return Ok((None, Some(proxy_user.to_owned()), creds));
+                }
+            }
+        }
+
         if let Some(ref dev_user) = self.config.dev_user {
             let creds = resolve_or_fallback_dev_credentials(
                 root_path,
@@ -1255,6 +1288,854 @@ impl GitService for GitServiceHandler {
             )),
         }
     }
+}
+
+/// Static asset HTTP response returned by [`serve_static_asset`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticAssetResponse {
+    pub status_code: u16,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
+}
+
+impl StaticAssetResponse {
+    #[must_use]
+    pub fn not_found() -> Self {
+        Self {
+            status_code: 404,
+            content_type: "text/plain; charset=utf-8",
+            body: b"not found".to_vec(),
+        }
+    }
+
+    #[must_use]
+    pub fn forbidden() -> Self {
+        Self {
+            status_code: 403,
+            content_type: "text/plain; charset=utf-8",
+            body: b"forbidden".to_vec(),
+        }
+    }
+}
+
+/// Returns the HTTP `Content-Type` header value for a static asset path based on its extension.
+#[must_use]
+pub fn content_type_for_path(path: &Path) -> &'static str {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return "application/octet-stream";
+    };
+    if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+        "text/html; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("wasm") {
+        "application/wasm"
+    } else if ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs") {
+        "application/javascript; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("css") {
+        "text/css; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("svg") {
+        "image/svg+xml"
+    } else if ext.eq_ignore_ascii_case("json") {
+        "application/json; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("png") {
+        "image/png"
+    } else if ext.eq_ignore_ascii_case("ico") {
+        "image/x-icon"
+    } else if ext.eq_ignore_ascii_case("txt") {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// Resolves and reads a static asset from `static_dir` for `request_path`, rejecting
+/// path traversal (`..`), backslashes, NUL bytes, and symlinks, and falling back to
+/// `<static_dir>/index.html` for unknown non-API SPA routes.
+#[must_use]
+pub fn serve_static_asset(static_dir: &Path, request_path: &str) -> StaticAssetResponse {
+    let raw_path = request_path.split('?').next().unwrap_or(request_path);
+    if raw_path == "/api" || raw_path.starts_with("/api/") {
+        return StaticAssetResponse::not_found();
+    }
+    if raw_path.contains('\\') || raw_path.contains('\0') {
+        return StaticAssetResponse::forbidden();
+    }
+    for seg in raw_path.split('/') {
+        if seg == ".." || seg == "." {
+            return StaticAssetResponse::forbidden();
+        }
+    }
+
+    let mut decode_buf = vec![0u8; raw_path.len().max(1)];
+    let Ok(decoded_path) = percent_decode_str(raw_path, &mut decode_buf) else {
+        return StaticAssetResponse::forbidden();
+    };
+    if decoded_path.contains('\\') || decoded_path.contains('\0') {
+        return StaticAssetResponse::forbidden();
+    }
+    for seg in decoded_path.split('/') {
+        if seg == ".." || seg == "." {
+            return StaticAssetResponse::forbidden();
+        }
+    }
+
+    match fs::symlink_metadata(static_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return StaticAssetResponse::forbidden();
+            }
+            if !meta.is_dir() {
+                return StaticAssetResponse::not_found();
+            }
+        }
+        Err(_) => return StaticAssetResponse::not_found(),
+    }
+
+    let segments: Vec<&str> = decoded_path.split('/').filter(|s| !s.is_empty()).collect();
+    if !segments.is_empty() {
+        let mut candidate = static_dir.to_path_buf();
+        let mut all_exist = true;
+        for seg in segments {
+            candidate.push(seg);
+            match fs::symlink_metadata(&candidate) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return StaticAssetResponse::forbidden();
+                    }
+                }
+                Err(_) => {
+                    all_exist = false;
+                    break;
+                }
+            }
+        }
+
+        if all_exist {
+            if let Ok(meta) = fs::symlink_metadata(&candidate) {
+                if meta.file_type().is_symlink() {
+                    return StaticAssetResponse::forbidden();
+                }
+                if meta.is_file() {
+                    return match fs::read(&candidate) {
+                        Ok(body) => StaticAssetResponse {
+                            status_code: 200,
+                            content_type: content_type_for_path(&candidate),
+                            body,
+                        },
+                        Err(_) => StaticAssetResponse::not_found(),
+                    };
+                }
+            }
+        }
+    }
+
+    let index_path = static_dir.join("index.html");
+    match fs::symlink_metadata(&index_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                StaticAssetResponse::forbidden()
+            } else if meta.is_file() {
+                match fs::read(&index_path) {
+                    Ok(body) => StaticAssetResponse {
+                        status_code: 200,
+                        content_type: "text/html; charset=utf-8",
+                        body,
+                    },
+                    Err(_) => StaticAssetResponse::not_found(),
+                }
+            } else {
+                StaticAssetResponse::not_found()
+            }
+        }
+        Err(_) => StaticAssetResponse::not_found(),
+    }
+}
+
+/// `roto-grpc` service adapter serving static assets and SPA `index.html` fallback
+/// when registered alongside `GitServiceServer` in a [`GrpcServer`].
+#[derive(Clone, Debug)]
+pub struct StaticAssetService {
+    pub static_dir: PathBuf,
+}
+
+impl StaticAssetService {
+    #[must_use]
+    pub fn new(static_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            static_dir: static_dir.into(),
+        }
+    }
+}
+
+impl GrpcService for StaticAssetService {
+    const SERVICE_NAME: &'static str = "ro_git.v1.StaticAssets";
+
+    fn call_unary(
+        &self,
+        _meta: &mut RpcMetadata<'_>,
+        _method_name: &str,
+        _req_payload: &[u8],
+        _writer: &mut BackwardWriter<'_>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        Err(GrpcStatus::unimplemented("unimplemented gRPC method"))
+    }
+
+    fn call_http<'a, 's, 'b>(
+        &self,
+        req: &HttpRequest<'a>,
+        scratch: &'s mut [u8],
+        writer: &mut BackwardWriter<'b>,
+    ) -> Option<Result<HttpResponse<'b>, GrpcStatus<'static>>> {
+        <Self as HttpService>::call_http(self, req, scratch, writer)
+    }
+}
+
+impl HttpService for StaticAssetService {
+    fn call_http<'a, 's, 'b>(
+        &self,
+        req: &HttpRequest<'a>,
+        _scratch: &'s mut [u8],
+        writer: &mut BackwardWriter<'b>,
+    ) -> Option<Result<HttpResponse<'b>, GrpcStatus<'static>>> {
+        if req.path == "/api" || req.path.starts_with("/api/") {
+            return None;
+        }
+        if req.method != HttpMethod::Get {
+            return Some(Err(GrpcStatus::invalid_argument("method not allowed")));
+        }
+
+        let asset = serve_static_asset(&self.static_dir, req.path);
+        match asset.status_code {
+            200 => {
+                if writer.write_bytes(&asset.body).is_err() || writer.check().is_err() {
+                    return Some(Err(GrpcStatus::resource_exhausted(
+                        "static asset response buffer exhausted",
+                    )));
+                }
+                let mut resp = match finish_writer_response(writer, None) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
+                resp.content_type = asset.content_type;
+                Some(Ok(resp))
+            }
+            403 => Some(Err(GrpcStatus::permission_denied("forbidden"))),
+            _ => Some(Err(GrpcStatus::not_found("not found"))),
+        }
+    }
+}
+
+const fn http_status_from_grpc_code(code: GrpcCode) -> u16 {
+    match code {
+        GrpcCode::Ok => 200,
+        GrpcCode::Cancelled => 499,
+        GrpcCode::InvalidArgument | GrpcCode::FailedPrecondition | GrpcCode::OutOfRange => 400,
+        GrpcCode::DeadlineExceeded => 504,
+        GrpcCode::NotFound => 404,
+        GrpcCode::AlreadyExists | GrpcCode::Aborted => 409,
+        GrpcCode::PermissionDenied => 403,
+        GrpcCode::ResourceExhausted => 429,
+        GrpcCode::Unimplemented => 501,
+        GrpcCode::Unavailable => 503,
+        GrpcCode::Unauthenticated => 401,
+        _ => 500,
+    }
+}
+
+fn push_json_escaped(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = fmt::Write::write_fmt(out, format_args!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn encode_auth_status_json(view: GetAuthStatusResponseView<'_>) -> Vec<u8> {
+    let authenticated = view.authenticated().unwrap_or(false);
+    let username = view.username().unwrap_or("");
+    let ssh_host = view.ssh_host().unwrap_or("");
+
+    let mut json = String::with_capacity(128);
+    json.push_str("{\"authenticated\":");
+    json.push_str(if authenticated { "true" } else { "false" });
+    json.push_str(",\"username\":");
+    push_json_escaped(&mut json, username);
+    json.push_str(",\"ssh_host\":");
+    push_json_escaped(&mut json, ssh_host);
+    json.push('}');
+    json.into_bytes()
+}
+
+fn encode_list_repositories_json(view: ListRepositoriesResponseView<'_>) -> Vec<u8> {
+    let auth_user = view.authenticated_user().unwrap_or("");
+    let ssh_host = view.ssh_host().unwrap_or("");
+
+    let mut json = String::with_capacity(512);
+    json.push_str("{\"repositories\":[");
+    let mut first = true;
+    for item in view.repositories().flatten() {
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push_str("{\"scope\":");
+        push_json_escaped(&mut json, item.scope().unwrap_or(""));
+        json.push_str(",\"owner\":");
+        push_json_escaped(&mut json, item.owner().unwrap_or(""));
+        json.push_str(",\"visibility\":");
+        push_json_escaped(&mut json, item.visibility().unwrap_or(""));
+        json.push_str(",\"name\":");
+        push_json_escaped(&mut json, item.name().unwrap_or(""));
+        json.push_str(",\"canonical_path\":");
+        push_json_escaped(&mut json, item.canonical_path().unwrap_or(""));
+        json.push_str(",\"ssh_url\":");
+        push_json_escaped(&mut json, item.ssh_url().unwrap_or(""));
+        json.push_str(",\"clone_command\":");
+        push_json_escaped(&mut json, item.clone_command().unwrap_or(""));
+        json.push('}');
+    }
+    json.push_str("],\"authenticated_user\":");
+    push_json_escaped(&mut json, auth_user);
+    json.push_str(",\"ssh_host\":");
+    push_json_escaped(&mut json, ssh_host);
+    json.push('}');
+    json.into_bytes()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedH1Request {
+    method: String,
+    path: String,
+    query: String,
+    authorization: Option<String>,
+    x_forwarded_user: Option<String>,
+    remote_user: Option<String>,
+    accept: Option<String>,
+    connection_close: bool,
+}
+
+fn parse_h1_headers(header_bytes: &[u8]) -> Option<(ParsedH1Request, usize)> {
+    let header_str = std::str::from_utf8(header_bytes).ok()?;
+    let mut lines = header_str.split("\r\n");
+    let req_line = lines.next()?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next()?.to_owned();
+    let target = parts.next()?;
+    let _version = parts.next()?;
+
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_owned(), q.to_owned()),
+        None => (target.to_owned(), String::new()),
+    };
+
+    let mut parsed = ParsedH1Request {
+        method,
+        path,
+        query,
+        ..ParsedH1Request::default()
+    };
+    let mut content_length = 0usize;
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            continue;
+        };
+        let name_trimmed = name.trim();
+        let val_trimmed = val.trim();
+        if name_trimmed.eq_ignore_ascii_case("authorization") {
+            parsed.authorization = Some(val_trimmed.to_owned());
+        } else if name_trimmed.eq_ignore_ascii_case("x-forwarded-user") {
+            parsed.x_forwarded_user = Some(val_trimmed.to_owned());
+        } else if name_trimmed.eq_ignore_ascii_case("remote-user") {
+            parsed.remote_user = Some(val_trimmed.to_owned());
+        } else if name_trimmed.eq_ignore_ascii_case("accept") {
+            parsed.accept = Some(val_trimmed.to_owned());
+        } else if name_trimmed.eq_ignore_ascii_case("content-length") {
+            content_length = val_trimmed.parse::<usize>().ok()?;
+        } else if name_trimmed.eq_ignore_ascii_case("connection")
+            && val_trimmed.eq_ignore_ascii_case("close")
+        {
+            parsed.connection_close = true;
+        }
+    }
+
+    Some((parsed, content_length))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn build_rpc_context(req: &ParsedH1Request) -> RpcContext<DynamicMetadata> {
+    let mut ctx = RpcContext::<DynamicMetadata>::new();
+    if let Some(ref auth) = req.authorization {
+        let _ = ctx.request.insert("authorization", auth);
+    }
+    if let Some(ref xfu) = req.x_forwarded_user {
+        let _ = ctx.request.insert("x-forwarded-user", xfu);
+    }
+    if let Some(ref ru) = req.remote_user {
+        let _ = ctx.request.insert("remote-user", ru);
+    }
+    ctx
+}
+
+fn wants_json(accept: Option<&str>) -> bool {
+    accept
+        .map(|a| {
+            a.split(',').any(|part| {
+                let media = part.split(';').next().unwrap_or("").trim();
+                media.eq_ignore_ascii_case("application/json")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> (u16, &'static str, Vec<u8>, bool) {
+    let is_head = req.method.eq_ignore_ascii_case("HEAD");
+    let is_get = req.method.eq_ignore_ascii_case("GET");
+
+    if req.path == API_AUTH_STATUS_PATH {
+        if !is_get && !is_head {
+            return (
+                405,
+                "text/plain; charset=utf-8",
+                b"method not allowed".to_vec(),
+                false,
+            );
+        }
+        let Ok(req_view) = GetAuthStatusRequestView::from_bytes(&[]) else {
+            return (
+                500,
+                "text/plain; charset=utf-8",
+                b"internal error".to_vec(),
+                is_head,
+            );
+        };
+        let mut ctx = build_rpc_context(req);
+        let mut meta = ctx.metadata();
+        let mut buf = vec![0u8; 4096];
+        let mut builder = GetAuthStatusResponseBuilder::new(&mut buf);
+        match handler.get_auth_status(&mut meta, req_view, &mut builder) {
+            Ok(()) => match builder.finish() {
+                Ok(proto_bytes) => {
+                    if wants_json(req.accept.as_deref()) {
+                        if let Ok(view) = GetAuthStatusResponseView::from_bytes(proto_bytes) {
+                            return (
+                                200,
+                                "application/json; charset=utf-8",
+                                encode_auth_status_json(view),
+                                is_head,
+                            );
+                        }
+                    }
+                    (200, "application/x-protobuf", proto_bytes.to_vec(), is_head)
+                }
+                Err(_) => (
+                    500,
+                    "text/plain; charset=utf-8",
+                    b"response buffer exhausted".to_vec(),
+                    is_head,
+                ),
+            },
+            Err(status) => (
+                http_status_from_grpc_code(status.code),
+                "text/plain; charset=utf-8",
+                status.message.as_bytes().to_vec(),
+                is_head,
+            ),
+        }
+    } else if req.path == API_REPOSITORIES_PATH {
+        if !is_get && !is_head {
+            return (
+                405,
+                "text/plain; charset=utf-8",
+                b"method not allowed".to_vec(),
+                false,
+            );
+        }
+        let mut raw_scope = "";
+        let mut raw_owner = "";
+        let mut raw_vis = "";
+        let mut raw_query = "";
+
+        for (k, v) in QueryIter::new(&req.query) {
+            match k {
+                "scope" => raw_scope = v,
+                "owner" => raw_owner = v,
+                "visibility" => raw_vis = v,
+                "query" => raw_query = v,
+                _ => {}
+            }
+        }
+
+        let mut scope_buf = [0u8; 128];
+        let mut owner_buf = [0u8; 128];
+        let mut vis_buf = [0u8; 128];
+        let mut query_buf = [0u8; 512];
+        let scope_val = percent_decode_str(raw_scope, &mut scope_buf).unwrap_or("");
+        let owner_val = percent_decode_str(raw_owner, &mut owner_buf).unwrap_or("");
+        let vis_val = percent_decode_str(raw_vis, &mut vis_buf).unwrap_or("");
+        let query_val = percent_decode_str(raw_query, &mut query_buf).unwrap_or("");
+
+        let mut req_buf = [0u8; 1024];
+        let mut req_builder = ListRepositoriesRequestBuilder::new(&mut req_buf);
+        req_builder
+            .write_query(query_val)
+            .write_visibility(vis_val)
+            .write_owner(owner_val)
+            .write_scope(scope_val);
+        let Ok(req_bytes) = req_builder.finish() else {
+            return (
+                400,
+                "text/plain; charset=utf-8",
+                b"query parameters too large".to_vec(),
+                is_head,
+            );
+        };
+        let Ok(req_view) = ListRepositoriesRequestView::from_bytes(req_bytes) else {
+            return (
+                400,
+                "text/plain; charset=utf-8",
+                b"invalid request".to_vec(),
+                is_head,
+            );
+        };
+
+        let mut ctx = build_rpc_context(req);
+        let mut meta = ctx.metadata();
+        let mut resp_buf = vec![0u8; 65_536];
+        let mut resp_builder = ListRepositoriesResponseBuilder::new(&mut resp_buf);
+        match handler.list_repositories(&mut meta, req_view, &mut resp_builder) {
+            Ok(()) => match resp_builder.finish() {
+                Ok(proto_bytes) => {
+                    if wants_json(req.accept.as_deref()) {
+                        if let Ok(view) = ListRepositoriesResponseView::from_bytes(proto_bytes) {
+                            return (
+                                200,
+                                "application/json; charset=utf-8",
+                                encode_list_repositories_json(view),
+                                is_head,
+                            );
+                        }
+                    }
+                    (200, "application/x-protobuf", proto_bytes.to_vec(), is_head)
+                }
+                Err(_) => (
+                    500,
+                    "text/plain; charset=utf-8",
+                    b"response buffer exhausted".to_vec(),
+                    is_head,
+                ),
+            },
+            Err(status) => (
+                http_status_from_grpc_code(status.code),
+                "text/plain; charset=utf-8",
+                status.message.as_bytes().to_vec(),
+                is_head,
+            ),
+        }
+    } else if req.path == "/api" || req.path.starts_with("/api/") {
+        (
+            404,
+            "text/plain; charset=utf-8",
+            b"not found".to_vec(),
+            is_head,
+        )
+    } else if !is_get && !is_head {
+        (
+            405,
+            "text/plain; charset=utf-8",
+            b"method not allowed".to_vec(),
+            false,
+        )
+    } else {
+        let asset = serve_static_asset(Path::new(&handler.config.static_dir), &req.path);
+        (asset.status_code, asset.content_type, asset.body, is_head)
+    }
+}
+
+fn write_h1_response<W: Write>(
+    stream: &mut W,
+    status_code: u16,
+    content_type: &str,
+    body: &[u8],
+    is_head: bool,
+    connection_close: bool,
+) -> io::Result<()> {
+    let reason = http_reason_phrase(status_code);
+    let conn_hdr = if connection_close {
+        "close"
+    } else {
+        "keep-alive"
+    };
+    let header = format!(
+        "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {conn_hdr}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    if !is_head {
+        stream.write_all(body)?;
+    }
+    stream.flush()
+}
+
+struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    const fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: Read> Read for PrefixedStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.offset < self.prefix.len() {
+            let rem = &self.prefix[self.offset..];
+            let n = buf.len().min(rem.len());
+            buf[..n].copy_from_slice(&rem[..n]);
+            self.offset += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for PrefixedStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn read_chunk_uninterrupted<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::Result<()> {
+    const MAX_HEADER_BYTES: usize = 32 * 1024;
+    const MAX_BODY_BYTES: usize = 64 * 1024;
+
+    let handler = GitServiceHandler::new(config);
+    let mut buf = Vec::with_capacity(4096);
+    let mut scratch = [0u8; 4096];
+
+    loop {
+        let header_end = loop {
+            if let Some(end) = find_header_end(&buf) {
+                break end;
+            }
+            if buf.len() >= MAX_HEADER_BYTES {
+                let _ = write_h1_response(
+                    &mut io,
+                    400,
+                    "text/plain; charset=utf-8",
+                    b"request headers too large",
+                    false,
+                    true,
+                );
+                return Ok(());
+            }
+            let n = read_chunk_uninterrupted(&mut io, &mut scratch)?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&scratch[..n]);
+        };
+
+        let Some((parsed_req, content_length)) = parse_h1_headers(&buf[..header_end]) else {
+            let _ = write_h1_response(
+                &mut io,
+                400,
+                "text/plain; charset=utf-8",
+                b"bad request",
+                false,
+                true,
+            );
+            return Ok(());
+        };
+
+        if content_length > MAX_BODY_BYTES {
+            let _ = write_h1_response(
+                &mut io,
+                413,
+                "text/plain; charset=utf-8",
+                b"payload too large",
+                false,
+                true,
+            );
+            return Ok(());
+        }
+
+        let total_req_len = header_end + content_length;
+        while buf.len() < total_req_len {
+            let n = read_chunk_uninterrupted(&mut io, &mut scratch)?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&scratch[..n]);
+        }
+
+        buf.drain(..total_req_len);
+
+        let (status_code, content_type, body, is_head) = dispatch_h1_request(&handler, &parsed_req);
+        write_h1_response(
+            &mut io,
+            status_code,
+            content_type,
+            &body,
+            is_head,
+            parsed_req.connection_close,
+        )?;
+
+        if parsed_req.connection_close {
+            return Ok(());
+        }
+    }
+}
+
+/// Serves a single TCP connection, automatically detecting HTTP/2 (`roto-grpc` unary gRPC
+/// and HTTP/2 routes) vs HTTP/1.1 (`/api/v1/...` and static asset hosting).
+pub fn serve_tcp_stream(mut stream: TcpStream, config: ServerConfig) -> io::Result<()> {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+
+    let mut prefix = Vec::with_capacity(64);
+    let mut temp = [0u8; 64];
+    let is_h2 = loop {
+        if let Some(detected) = roto_grpc::is_h2_client_preface(&prefix) {
+            break detected;
+        }
+        let n = read_chunk_uninterrupted(&mut stream, &mut temp)?;
+        if n == 0 {
+            if prefix.is_empty() {
+                return Ok(());
+            }
+            break false;
+        }
+        prefix.extend_from_slice(&temp[..n]);
+    };
+
+    let io = PrefixedStream::new(prefix, stream);
+
+    if is_h2 {
+        let static_service = StaticAssetService::new(&config.static_dir);
+        let git_service = GitServiceHandler::new(config).into_server();
+        let routes: [&dyn Route; 2] = [&git_service, &static_service];
+        let mut msg_buf = vec![0u8; 128 * 1024];
+        let mut tx_buf = vec![0u8; 128 * 1024];
+        let mut server =
+            GrpcServer::<4, 4096, DynamicMetadata>::with_metadata_store(&routes, &mut msg_buf, &mut tx_buf);
+        let _ = roto_grpc::serve_std_io(&mut server, io);
+        Ok(())
+    } else {
+        serve_h1_connection(io, config)
+    }
+}
+
+/// Handle to a running background `ro-git-server` TCP listener.
+pub struct RunningServer {
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunningServer {
+    /// Returns the bound local socket address of the server.
+    #[must_use]
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Signals the server accept loop to stop and waits for it to exit.
+    pub fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.shutdown_inner();
+    }
+}
+
+/// Binds a TCP listener to `config.listen_addr` and spawns a background accept thread
+/// serving both `roto-grpc` HTTP/2 and HTTP/1.1 requests.
+pub fn start_server(config: ServerConfig) -> io::Result<RunningServer> {
+    let listener = TcpListener::bind(&config.listen_addr)?;
+    let local_addr = listener.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown);
+
+    let join_handle = std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(stream) = incoming {
+                let conn_config = config.clone();
+                std::thread::spawn(move || {
+                    let _ = serve_tcp_stream(stream, conn_config);
+                });
+            }
+        }
+    });
+
+    Ok(RunningServer {
+        local_addr,
+        shutdown,
+        join_handle: Some(join_handle),
+    })
+}
+
+/// Binds a TCP listener to `config.listen_addr` and serves incoming HTTP/2 and HTTP/1.1
+/// connections on the current thread until the process terminates.
+pub fn run_server(config: ServerConfig) -> io::Result<()> {
+    let listener = TcpListener::bind(&config.listen_addr)?;
+    for stream in listener.incoming().flatten() {
+        let conn_config = config.clone();
+        std::thread::spawn(move || {
+            let _ = serve_tcp_stream(stream, conn_config);
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use std::env;
 use std::process;
 
-use ro_git_server::{run_worker_stdio, GitServiceHandler, ServerConfig};
+use ro_git_server::{run_server, run_worker_stdio, ServerConfig};
 
 fn main() {
     let mut args = env::args();
@@ -15,5 +15,9 @@ fn main() {
     }
 
     let config = ServerConfig::from_env();
-    let _service = GitServiceHandler::new(config).into_server();
+    if let Err(err) = run_server(config) {
+        eprintln!("ro-git-server error: {err}");
+        process::exit(1);
+    }
 }
+
