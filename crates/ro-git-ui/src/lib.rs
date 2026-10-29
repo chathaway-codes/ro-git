@@ -165,13 +165,7 @@ impl RepositoryItem {
     /// Returns the singular badge label (`"user"` or `"team"`) for this repository's scope.
     #[must_use]
     pub fn scope_badge(&self) -> &'static str {
-        if self.scope == SCOPE_USERS {
-            "user"
-        } else if self.scope == SCOPE_TEAMS {
-            "team"
-        } else {
-            "repo"
-        }
+        scope_badge_for(&self.scope)
     }
 
     /// Returns the visibility badge label (`"public"` or `"private"`).
@@ -295,19 +289,25 @@ pub fn decode_repositories_response(bytes: &[u8]) -> Result<RepositoriesSnapshot
         repositories.push(item);
     }
 
-    repositories.sort_by(|a, b| {
-        scope_sort_rank(&a.scope)
-            .cmp(&scope_sort_rank(&b.scope))
-            .then_with(|| a.owner.cmp(&b.owner))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.visibility.cmp(&b.visibility))
-    });
+    sort_repositories(&mut repositories);
 
     Ok(RepositoriesSnapshot {
         repositories,
         authenticated_user,
         ssh_host,
     })
+}
+
+#[inline]
+#[must_use]
+fn scope_badge_for(scope: &str) -> &'static str {
+    if scope == SCOPE_USERS {
+        "user"
+    } else if scope == SCOPE_TEAMS {
+        "team"
+    } else {
+        "repo"
+    }
 }
 
 #[inline]
@@ -320,6 +320,16 @@ fn scope_sort_rank(scope: &str) -> u8 {
     } else {
         2
     }
+}
+
+fn sort_repositories(repos: &mut [RepositoryItem]) {
+    repos.sort_by(|a, b| {
+        scope_sort_rank(&a.scope)
+            .cmp(&scope_sort_rank(&b.scope))
+            .then_with(|| a.owner.cmp(&b.owner))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.visibility.cmp(&b.visibility))
+    });
 }
 
 /// Top-level scope filter (`All`, `Users`, or `Teams`).
@@ -494,13 +504,7 @@ impl RepositoryGroup {
     /// Returns the singular badge label (`"user"` or `"team"`) for this group.
     #[must_use]
     pub fn scope_badge(&self) -> &'static str {
-        if self.scope == SCOPE_USERS {
-            "user"
-        } else if self.scope == SCOPE_TEAMS {
-            "team"
-        } else {
-            "repo"
-        }
+        scope_badge_for(&self.scope)
     }
 }
 
@@ -525,13 +529,7 @@ pub fn filter_repositories(repos: &[RepositoryItem], filter: &RepoFilter) -> Vec
         .filter(|repo| filter.matches(repo))
         .cloned()
         .collect();
-    matched.sort_by(|a, b| {
-        scope_sort_rank(&a.scope)
-            .cmp(&scope_sort_rank(&b.scope))
-            .then_with(|| a.owner.cmp(&b.owner))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.visibility.cmp(&b.visibility))
-    });
+    sort_repositories(&mut matched);
     matched
 }
 
@@ -539,13 +537,7 @@ pub fn filter_repositories(repos: &[RepositoryItem], filter: &RepoFilter) -> Vec
 #[must_use]
 pub fn group_repositories(repos: &[RepositoryItem]) -> Vec<RepositoryGroup> {
     let mut sorted = repos.to_vec();
-    sorted.sort_by(|a, b| {
-        scope_sort_rank(&a.scope)
-            .cmp(&scope_sort_rank(&b.scope))
-            .then_with(|| a.owner.cmp(&b.owner))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.visibility.cmp(&b.visibility))
-    });
+    sort_repositories(&mut sorted);
 
     let mut groups: Vec<RepositoryGroup> = Vec::new();
     for repo in sorted {

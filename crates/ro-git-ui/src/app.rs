@@ -2,12 +2,15 @@ use crate::{
     available_owners, build_bearer_token_from_signature, build_sign_in_challenge,
     copy_button_label, decode_auth_status_response, decode_repositories_response,
     filter_and_group_repositories, format_authorization_header, verify_auth_status_for_user,
-    AuthStatus, CopyTarget, RepoFilter, RepositoryItem, ScopeFilter, VisibilityFilter,
-    DEFAULT_SSH_HOST, DEFAULT_TTL_SECS, LOCAL_STORAGE_TOKEN_KEY, TTL_OPTIONS,
+    AuthStatus, CopyTarget, RepoFilter, RepositoriesSnapshot, RepositoryGroup, RepositoryItem,
+    ScopeFilter, SignInChallenge, VisibilityFilter, DEFAULT_SSH_HOST, DEFAULT_TTL_SECS,
+    LOCAL_STORAGE_TOKEN_KEY, TTL_OPTIONS,
 };
 use gloo_timers::callback::Timeout;
 use js_sys::{Date, Uint8Array};
 use ro_git_proto::{API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH};
+use std::cell::Cell;
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
@@ -93,6 +96,458 @@ async fn fetch_protobuf_bytes(path: &str, token: Option<&str>) -> Result<Vec<u8>
     Ok(Uint8Array::new(&buf_val).to_vec())
 }
 
+async fn fetch_auth_status(token: Option<&str>) -> Result<AuthStatus, String> {
+    let bytes = fetch_protobuf_bytes(API_AUTH_STATUS_PATH, token).await?;
+    decode_auth_status_response(&bytes)
+}
+
+async fn fetch_repositories(token: Option<&str>) -> Result<RepositoriesSnapshot, String> {
+    let bytes = fetch_protobuf_bytes(API_REPOSITORIES_PATH, token).await?;
+    decode_repositories_response(&bytes)
+}
+
+fn render_header(
+    auth_status: &AuthStatus,
+    loading: bool,
+    on_refresh: Callback<MouseEvent>,
+    on_open_sign_in: Callback<MouseEvent>,
+    on_sign_out: Callback<MouseEvent>,
+) -> Html {
+    html! {
+        <header class="app-header">
+            <div class="brand-block">
+                <div class="brand-title-row">
+                    <h1 class="brand-title">{ "ro-git" }</h1>
+                    <span class="host-pill" title="Configured SSH host">
+                        { format!("ssh://{}", auth_status.ssh_host) }
+                    </span>
+                </div>
+                <p class="brand-subtitle">{ "Read-Only Git Repository Index" }</p>
+            </div>
+
+            <div class="auth-bar">
+                <span
+                    class={classes!(
+                        "auth-status-badge",
+                        if auth_status.authenticated { "auth-authenticated" } else { "auth-anonymous" }
+                    )}
+                >
+                    { auth_status.header_label() }
+                </span>
+                <button
+                    type="button"
+                    class="btn btn-secondary"
+                    onclick={on_refresh}
+                    disabled={loading}
+                >
+                    { if loading { "Refreshing..." } else { "Refresh" } }
+                </button>
+                if auth_status.authenticated {
+                    <button
+                        type="button"
+                        class="btn btn-danger"
+                        onclick={on_sign_out}
+                    >
+                        { "Sign Out" }
+                    </button>
+                } else {
+                    <button
+                        type="button"
+                        class="btn btn-primary"
+                        onclick={on_open_sign_in}
+                    >
+                        { "Sign In with SSH Key" }
+                    </button>
+                }
+            </div>
+        </header>
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_filter_bar(
+    filter: &RepoFilter,
+    owners: &[String],
+    matched_count: usize,
+    total_count: usize,
+    on_query_input: Callback<InputEvent>,
+    on_scope_change: Callback<Event>,
+    on_owner_change: Callback<Event>,
+    on_visibility_change: Callback<Event>,
+    on_clear_filters: Callback<MouseEvent>,
+) -> Html {
+    let custom_owner_selected = !filter.owner.is_empty()
+        && !owners
+            .iter()
+            .any(|owner| owner.eq_ignore_ascii_case(&filter.owner));
+
+    html! {
+        <section class="filter-bar" aria-label="Repository Filters">
+            <div class="filter-controls">
+                <div class="filter-field filter-search">
+                    <label for="repo-search-input">{ "Search" }</label>
+                    <input
+                        id="repo-search-input"
+                        type="search"
+                        placeholder="Filter by owner, repo name, or canonical path..."
+                        value={filter.query.clone()}
+                        oninput={on_query_input}
+                    />
+                </div>
+
+                <div class="filter-field">
+                    <label for="repo-scope-select">{ "Scope" }</label>
+                    <select
+                        id="repo-scope-select"
+                        value={filter.scope.as_str()}
+                        onchange={on_scope_change}
+                    >
+                        <option value={ScopeFilter::All.as_str()} selected={filter.scope == ScopeFilter::All}>
+                            { ScopeFilter::All.label() }
+                        </option>
+                        <option value={ScopeFilter::Users.as_str()} selected={filter.scope == ScopeFilter::Users}>
+                            { ScopeFilter::Users.label() }
+                        </option>
+                        <option value={ScopeFilter::Teams.as_str()} selected={filter.scope == ScopeFilter::Teams}>
+                            { ScopeFilter::Teams.label() }
+                        </option>
+                    </select>
+                </div>
+
+                <div class="filter-field">
+                    <label for="repo-owner-select">{ "Owner / Team" }</label>
+                    <select
+                        id="repo-owner-select"
+                        value={filter.owner.clone()}
+                        onchange={on_owner_change}
+                    >
+                        <option value="" selected={filter.owner.is_empty()}>
+                            { "All Owners / Teams" }
+                        </option>
+                        if custom_owner_selected {
+                            <option value={filter.owner.clone()} selected=true>
+                                { filter.owner.clone() }
+                            </option>
+                        }
+                        { for owners.iter().map(|owner| {
+                            let selected = filter.owner.eq_ignore_ascii_case(owner);
+                            html! {
+                                <option value={owner.clone()} selected={selected}>
+                                    { owner.clone() }
+                                </option>
+                            }
+                        }) }
+                    </select>
+                </div>
+
+                <div class="filter-field">
+                    <label for="repo-visibility-select">{ "Visibility" }</label>
+                    <select
+                        id="repo-visibility-select"
+                        value={filter.visibility.as_str()}
+                        onchange={on_visibility_change}
+                    >
+                        <option value={VisibilityFilter::All.as_str()} selected={filter.visibility == VisibilityFilter::All}>
+                            { VisibilityFilter::All.label() }
+                        </option>
+                        <option value={VisibilityFilter::Public.as_str()} selected={filter.visibility == VisibilityFilter::Public}>
+                            { VisibilityFilter::Public.label() }
+                        </option>
+                        <option value={VisibilityFilter::Private.as_str()} selected={filter.visibility == VisibilityFilter::Private}>
+                            { VisibilityFilter::Private.label() }
+                        </option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="filter-summary-row">
+                <span class="repo-count-summary">
+                    { format!("Showing {matched_count} of {total_count} repositories") }
+                </span>
+                if !filter.is_empty() {
+                    <button
+                        type="button"
+                        class="btn btn-link"
+                        onclick={on_clear_filters}
+                    >
+                        { "Clear Filters" }
+                    </button>
+                }
+            </div>
+        </section>
+    }
+}
+
+fn render_repo_card(
+    repo: &RepositoryItem,
+    ssh_host: &str,
+    auth_user: Option<&str>,
+    copied_target: Option<&CopyTarget>,
+    trigger_copy: &Callback<(String, CopyTarget)>,
+) -> Html {
+    let scope_badge = repo.scope_badge();
+    let vis_badge = repo.visibility_badge();
+    let canonical = repo.canonical_path.clone();
+    let clone_cmd = repo.clone_command_for(ssh_host, auth_user);
+    let ssh_url = repo.ssh_url_for(ssh_host, auth_user);
+
+    let clone_target = CopyTarget::CloneCommand(canonical.clone());
+    let ssh_target = CopyTarget::SshUrl(canonical.clone());
+
+    let is_clone_copied = copied_target == Some(&clone_target);
+    let is_ssh_copied = copied_target == Some(&ssh_target);
+
+    let clone_btn_label = copy_button_label(copied_target, &clone_target, "Copy git clone");
+    let ssh_btn_label = copy_button_label(copied_target, &ssh_target, "Copy SSH URL");
+
+    let on_copy_clone = {
+        let trigger_copy = trigger_copy.clone();
+        let clone_cmd = clone_cmd.clone();
+        Callback::from(move |_: MouseEvent| {
+            trigger_copy.emit((clone_cmd.clone(), clone_target.clone()));
+        })
+    };
+
+    let on_copy_ssh = {
+        let trigger_copy = trigger_copy.clone();
+        let ssh_url = ssh_url.clone();
+        Callback::from(move |_: MouseEvent| {
+            trigger_copy.emit((ssh_url.clone(), ssh_target.clone()));
+        })
+    };
+
+    html! {
+        <article class="repo-card" key={canonical.clone()}>
+            <div class="repo-card-main">
+                <div class="repo-title-row">
+                    <span class="repo-name">{ format!("{}.git", repo.name) }</span>
+                    <span class={classes!("badge", format!("badge-scope-{scope_badge}"))}>
+                        { scope_badge }
+                    </span>
+                    <span class={classes!("badge", format!("badge-vis-{vis_badge}"))}>
+                        { vis_badge }
+                    </span>
+                </div>
+                <div class="repo-canonical-path">
+                    <code>{ &canonical }</code>
+                </div>
+                <div class="repo-command-preview">
+                    <code>{ &clone_cmd }</code>
+                </div>
+            </div>
+
+            <div class="repo-card-actions">
+                <button
+                    type="button"
+                    class={classes!("btn", "btn-copy", is_clone_copied.then_some("btn-copied"))}
+                    onclick={on_copy_clone}
+                    title={clone_cmd}
+                >
+                    { clone_btn_label }
+                </button>
+                <button
+                    type="button"
+                    class={classes!("btn", "btn-copy", is_ssh_copied.then_some("btn-copied"))}
+                    onclick={on_copy_ssh}
+                    title={ssh_url}
+                >
+                    { ssh_btn_label }
+                </button>
+            </div>
+        </article>
+    }
+}
+
+fn render_repo_group(
+    group: &RepositoryGroup,
+    ssh_host: &str,
+    auth_user: Option<&str>,
+    copied_target: Option<&CopyTarget>,
+    trigger_copy: &Callback<(String, CopyTarget)>,
+) -> Html {
+    let group_badge = group.scope_badge();
+    let group_count = group.repositories.len();
+
+    html! {
+        <div class="repo-group" key={group.group_path.clone()}>
+            <div class="repo-group-header">
+                <div class="repo-group-title">
+                    <span class={classes!("badge", format!("badge-scope-{group_badge}"))}>
+                        { group_badge }
+                    </span>
+                    <h2 class="group-path">{ &group.group_path }</h2>
+                </div>
+                <span class="group-count">
+                    { if group_count == 1 {
+                        "1 repository".to_owned()
+                    } else {
+                        format!("{group_count} repositories")
+                    } }
+                </span>
+            </div>
+
+            <div class="repo-list">
+                { for group.repositories.iter().map(|repo| {
+                    render_repo_card(repo, ssh_host, auth_user, copied_target, trigger_copy)
+                }) }
+            </div>
+        </div>
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_sign_in_modal(
+    username: &str,
+    ttl_secs: u64,
+    signature: &str,
+    challenge_res: &Result<SignInChallenge, String>,
+    modal_error: Option<&str>,
+    verifying: bool,
+    copied_target: Option<&CopyTarget>,
+    trigger_copy: &Callback<(String, CopyTarget)>,
+    on_username_input: Callback<InputEvent>,
+    on_ttl_change: Callback<Event>,
+    on_signature_input: Callback<InputEvent>,
+    on_submit: Callback<SubmitEvent>,
+    on_close: Callback<MouseEvent>,
+) -> Html {
+    html! {
+        <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="ssh-modal-title">
+            <div class="modal-panel">
+                <div class="modal-header">
+                    <h2 id="ssh-modal-title">{ "Sign In with SSH Key (Stateless sshsig)" }</h2>
+                    <button
+                        type="button"
+                        class="btn btn-icon"
+                        onclick={on_close.clone()}
+                        aria-label="Close modal"
+                    >
+                        { "×" }
+                    </button>
+                </div>
+
+                <form class="modal-body" onsubmit={on_submit}>
+                    <p class="modal-intro">
+                        { "Sign a timestamped challenge locally with your SSH key using " }
+                        <code>{ "ssh-keygen -Y sign" }</code>
+                        { " to unlock private user and team repositories." }
+                    </p>
+
+                    <div class="modal-grid">
+                        <div class="filter-field">
+                            <label for="ssh-username-input">{ "1. Linux / Git Username" }</label>
+                            <input
+                                id="ssh-username-input"
+                                type="text"
+                                placeholder="e.g. alice"
+                                value={username.to_owned()}
+                                oninput={on_username_input}
+                                autocomplete="username"
+                                required=true
+                            />
+                        </div>
+
+                        <div class="filter-field">
+                            <label for="ssh-ttl-select">{ "Token Lifetime (TTL)" }</label>
+                            <select
+                                id="ssh-ttl-select"
+                                value={ttl_secs.to_string()}
+                                onchange={on_ttl_change}
+                            >
+                                { for TTL_OPTIONS.iter().map(|opt| {
+                                    let selected = ttl_secs == opt.seconds;
+                                    html! {
+                                        <option value={opt.seconds.to_string()} selected={selected}>
+                                            { opt.label }
+                                        </option>
+                                    }
+                                }) }
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="filter-field">
+                        <div class="label-with-action">
+                            <label>{ "2. Run in your terminal to sign the challenge" }</label>
+                            if let Ok(challenge) = challenge_res {
+                                <button
+                                    type="button"
+                                    class={classes!(
+                                        "btn",
+                                        "btn-copy",
+                                        "btn-sm",
+                                        (copied_target == Some(&CopyTarget::SignCommand)).then_some("btn-copied")
+                                    )}
+                                    onclick={{
+                                        let cmd = challenge.sign_command.clone();
+                                        let trigger_copy = trigger_copy.clone();
+                                        Callback::from(move |_: MouseEvent| {
+                                            trigger_copy.emit((cmd.clone(), CopyTarget::SignCommand));
+                                        })
+                                    }}
+                                >
+                                    { copy_button_label(
+                                        copied_target,
+                                        &CopyTarget::SignCommand,
+                                        "Copy Command",
+                                    ) }
+                                </button>
+                            }
+                        </div>
+
+                        <pre class="command-box">
+                            <code>
+                                { match challenge_res {
+                                    Ok(challenge) => challenge.sign_command.clone(),
+                                    Err(_) => "Enter a valid username ([a-zA-Z0-9_-]+) above to generate your ssh-keygen command.".to_owned(),
+                                } }
+                            </code>
+                        </pre>
+                    </div>
+
+                    <div class="filter-field">
+                        <label for="ssh-signature-textarea">
+                            { "3. Paste SSH Signature Output" }
+                        </label>
+                        <textarea
+                            id="ssh-signature-textarea"
+                            rows="6"
+                            placeholder="-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----"
+                            value={signature.to_owned()}
+                            oninput={on_signature_input}
+                            required=true
+                        />
+                    </div>
+
+                    if let Some(err) = modal_error {
+                        <div class="alert alert-error" role="alert">
+                            <span>{ err }</span>
+                        </div>
+                    }
+
+                    <div class="modal-footer">
+                        <button
+                            type="button"
+                            class="btn btn-secondary"
+                            onclick={on_close}
+                            disabled={verifying}
+                        >
+                            { "Cancel" }
+                        </button>
+                        <button
+                            type="submit"
+                            class="btn btn-primary"
+                            disabled={verifying || challenge_res.is_err() || signature.trim().is_empty()}
+                        >
+                            { if verifying { "Verifying..." } else { "Verify & Sign In" } }
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
     let auth_status = use_state(AuthStatus::default);
@@ -122,56 +577,66 @@ pub fn app() -> Html {
         let seq = *refresh_seq;
 
         use_effect_with(seq, move |_| {
+            let cancelled = Rc::new(Cell::new(false));
+            let cancelled_for_task = Rc::clone(&cancelled);
+            let mut current_auth = (*auth_status).clone();
+
             loading.set(true);
             load_error.set(None);
 
             spawn_local(async move {
                 let stored_token = load_stored_token();
-                let auth_res =
-                    fetch_protobuf_bytes(API_AUTH_STATUS_PATH, stored_token.as_deref()).await;
-                let effective_token = match auth_res {
-                    Ok(bytes) => match decode_auth_status_response(&bytes) {
-                        Ok(status) => {
-                            let is_authed = status.authenticated;
-                            auth_status.set(status);
-                            if !is_authed && stored_token.is_some() {
-                                clear_stored_token();
-                                None
-                            } else {
-                                stored_token
-                            }
+                let effective_token = match fetch_auth_status(stored_token.as_deref()).await {
+                    Ok(status) => {
+                        if cancelled_for_task.get() {
+                            return;
                         }
-                        Err(err) => {
-                            load_error.set(Some(err));
+                        let is_authed = status.authenticated;
+                        current_auth = status.clone();
+                        auth_status.set(status);
+                        if !is_authed && stored_token.is_some() {
+                            clear_stored_token();
+                            None
+                        } else {
                             stored_token
                         }
-                    },
+                    }
                     Err(err) => {
+                        if cancelled_for_task.get() {
+                            return;
+                        }
                         load_error.set(Some(err));
                         stored_token
                     }
                 };
 
-                match fetch_protobuf_bytes(API_REPOSITORIES_PATH, effective_token.as_deref()).await
-                {
-                    Ok(bytes) => match decode_repositories_response(&bytes) {
-                        Ok(snapshot) => {
-                            if snapshot.ssh_host != DEFAULT_SSH_HOST {
-                                let mut updated = (*auth_status).clone();
-                                updated.ssh_host = snapshot.ssh_host.clone();
-                                auth_status.set(updated);
-                            }
-                            repositories.set(snapshot.repositories);
+                match fetch_repositories(effective_token.as_deref()).await {
+                    Ok(snapshot) => {
+                        if cancelled_for_task.get() {
+                            return;
                         }
-                        Err(err) => load_error.set(Some(err)),
-                    },
-                    Err(err) => load_error.set(Some(err)),
+                        if snapshot.ssh_host != DEFAULT_SSH_HOST
+                            && current_auth.ssh_host != snapshot.ssh_host
+                        {
+                            current_auth.ssh_host = snapshot.ssh_host.clone();
+                            auth_status.set(current_auth);
+                        }
+                        repositories.set(snapshot.repositories);
+                    }
+                    Err(err) => {
+                        if cancelled_for_task.get() {
+                            return;
+                        }
+                        load_error.set(Some(err));
+                    }
                 }
 
-                loading.set(false);
+                if !cancelled_for_task.get() {
+                    loading.set(false);
+                }
             });
 
-            || ()
+            move || cancelled.set(true)
         });
     }
 
@@ -230,7 +695,6 @@ pub fn app() -> Html {
         })
     };
 
-    // Filter callbacks
     let on_query_input = {
         let filter = filter.clone();
         Callback::from(move |e: InputEvent| {
@@ -247,6 +711,7 @@ pub fn app() -> Html {
 
     let on_scope_change = {
         let filter = filter.clone();
+        let repositories = repositories.clone();
         Callback::from(move |e: Event| {
             if let Some(select) = e
                 .target()
@@ -254,6 +719,15 @@ pub fn app() -> Html {
             {
                 let mut next = (*filter).clone();
                 next.scope = ScopeFilter::from_value(&select.value());
+                if !next.owner.is_empty() {
+                    let scope_owners = available_owners(&repositories, next.scope);
+                    if !scope_owners
+                        .iter()
+                        .any(|o| o.eq_ignore_ascii_case(&next.owner))
+                    {
+                        next.owner.clear();
+                    }
+                }
                 filter.set(next);
             }
         })
@@ -294,7 +768,6 @@ pub fn app() -> Html {
         })
     };
 
-    // Modal input callbacks
     let on_modal_username_input = {
         let modal_username = modal_username.clone();
         let modal_base_unix = modal_base_unix.clone();
@@ -357,6 +830,10 @@ pub fn app() -> Html {
 
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
+            if *modal_verifying {
+                return;
+            }
+
             let challenge = match &challenge_res {
                 Ok(c) => c.clone(),
                 Err(err) => {
@@ -384,31 +861,20 @@ pub fn app() -> Html {
             let refresh_seq = refresh_seq.clone();
 
             spawn_local(async move {
-                match fetch_protobuf_bytes(API_AUTH_STATUS_PATH, Some(&token)).await {
-                    Ok(bytes) => match decode_auth_status_response(&bytes) {
-                        Ok(status) => match verify_auth_status_for_user(&status, &challenge.username)
-                        {
-                            Ok(()) => {
-                                save_stored_token(&token);
-                                auth_status.set(status);
-                                modal_verifying.set(false);
-                                modal_open.set(false);
-                                refresh_seq.set(refresh_seq.wrapping_add(1));
-                            }
-                            Err(err) => {
-                                modal_error.set(Some(err));
-                                modal_verifying.set(false);
-                            }
-                        },
-                        Err(err) => {
-                            modal_error.set(Some(err));
-                            modal_verifying.set(false);
-                        }
-                    },
+                let result = fetch_auth_status(Some(&token)).await.and_then(|status| {
+                    verify_auth_status_for_user(&status, &challenge.username).map(|()| status)
+                });
+
+                match result {
+                    Ok(status) => {
+                        save_stored_token(&token);
+                        auth_status.set(status);
+                        modal_verifying.set(false);
+                        modal_open.set(false);
+                        refresh_seq.set(refresh_seq.wrapping_add(1));
+                    }
                     Err(err) => {
-                        modal_error.set(Some(format!(
-                            "Failed to verify token against {API_AUTH_STATUS_PATH}: {err}"
-                        )));
+                        modal_error.set(Some(err));
                         modal_verifying.set(false);
                     }
                 }
@@ -425,142 +891,25 @@ pub fn app() -> Html {
 
     html! {
         <main class="ro-git-app">
-            <header class="app-header">
-                <div class="brand-block">
-                    <div class="brand-title-row">
-                        <h1 class="brand-title">{ "ro-git" }</h1>
-                        <span class="host-pill" title="Configured SSH host">
-                            { format!("ssh://{active_ssh_host}") }
-                        </span>
-                    </div>
-                    <p class="brand-subtitle">{ "Read-Only Git Repository Index" }</p>
-                </div>
+            { render_header(
+                &auth_status,
+                *loading,
+                on_refresh.clone(),
+                on_open_sign_in,
+                on_sign_out,
+            ) }
 
-                <div class="auth-bar">
-                    <span
-                        class={classes!(
-                            "auth-status-badge",
-                            if auth_status.authenticated { "auth-authenticated" } else { "auth-anonymous" }
-                        )}
-                    >
-                        { auth_status.header_label() }
-                    </span>
-                    <button
-                        type="button"
-                        class="btn btn-secondary"
-                        onclick={on_refresh.clone()}
-                        disabled={*loading}
-                    >
-                        { if *loading { "Refreshing..." } else { "Refresh" } }
-                    </button>
-                    if auth_status.authenticated {
-                        <button
-                            type="button"
-                            class="btn btn-danger"
-                            onclick={on_sign_out}
-                        >
-                            { "Sign Out" }
-                        </button>
-                    } else {
-                        <button
-                            type="button"
-                            class="btn btn-primary"
-                            onclick={on_open_sign_in}
-                        >
-                            { "Sign In with SSH Key" }
-                        </button>
-                    }
-                </div>
-            </header>
-
-            <section class="filter-bar" aria-label="Repository Filters">
-                <div class="filter-controls">
-                    <div class="filter-field filter-search">
-                        <label for="repo-search-input">{ "Search" }</label>
-                        <input
-                            id="repo-search-input"
-                            type="search"
-                            placeholder="Filter by owner, repo name, or canonical path..."
-                            value={filter.query.clone()}
-                            oninput={on_query_input}
-                        />
-                    </div>
-
-                    <div class="filter-field">
-                        <label for="repo-scope-select">{ "Scope" }</label>
-                        <select
-                            id="repo-scope-select"
-                            value={filter.scope.as_str()}
-                            onchange={on_scope_change}
-                        >
-                            <option value={ScopeFilter::All.as_str()} selected={filter.scope == ScopeFilter::All}>
-                                { ScopeFilter::All.label() }
-                            </option>
-                            <option value={ScopeFilter::Users.as_str()} selected={filter.scope == ScopeFilter::Users}>
-                                { ScopeFilter::Users.label() }
-                            </option>
-                            <option value={ScopeFilter::Teams.as_str()} selected={filter.scope == ScopeFilter::Teams}>
-                                { ScopeFilter::Teams.label() }
-                            </option>
-                        </select>
-                    </div>
-
-                    <div class="filter-field">
-                        <label for="repo-owner-select">{ "Owner / Team" }</label>
-                        <select
-                            id="repo-owner-select"
-                            value={filter.owner.clone()}
-                            onchange={on_owner_change}
-                        >
-                            <option value="" selected={filter.owner.is_empty()}>
-                                { "All Owners / Teams" }
-                            </option>
-                            { for owners.iter().map(|owner| {
-                                let selected = filter.owner.eq_ignore_ascii_case(owner);
-                                html! {
-                                    <option value={owner.clone()} selected={selected}>
-                                        { owner.clone() }
-                                    </option>
-                                }
-                            }) }
-                        </select>
-                    </div>
-
-                    <div class="filter-field">
-                        <label for="repo-visibility-select">{ "Visibility" }</label>
-                        <select
-                            id="repo-visibility-select"
-                            value={filter.visibility.as_str()}
-                            onchange={on_visibility_change}
-                        >
-                            <option value={VisibilityFilter::All.as_str()} selected={filter.visibility == VisibilityFilter::All}>
-                                { VisibilityFilter::All.label() }
-                            </option>
-                            <option value={VisibilityFilter::Public.as_str()} selected={filter.visibility == VisibilityFilter::Public}>
-                                { VisibilityFilter::Public.label() }
-                            </option>
-                            <option value={VisibilityFilter::Private.as_str()} selected={filter.visibility == VisibilityFilter::Private}>
-                                { VisibilityFilter::Private.label() }
-                            </option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="filter-summary-row">
-                    <span class="repo-count-summary">
-                        { format!("Showing {matched_count} of {total_count} repositories") }
-                    </span>
-                    if !filter.is_empty() {
-                        <button
-                            type="button"
-                            class="btn btn-link"
-                            onclick={on_clear_filters}
-                        >
-                            { "Clear Filters" }
-                        </button>
-                    }
-                </div>
-            </section>
+            { render_filter_bar(
+                &filter,
+                &owners,
+                matched_count,
+                total_count,
+                on_query_input,
+                on_scope_change,
+                on_owner_change,
+                on_visibility_change,
+                on_clear_filters,
+            ) }
 
             if let Some(err) = (*load_error).clone() {
                 <div class="alert alert-error" role="alert">
@@ -590,252 +939,34 @@ pub fn app() -> Html {
                         }
                     </div>
                 } else {
-                    { for groups.into_iter().map(|group| {
-                        let group_badge = group.scope_badge();
-                        let group_count = group.repositories.len();
-                        html! {
-                            <div class="repo-group" key={group.group_path.clone()}>
-                                <div class="repo-group-header">
-                                    <div class="repo-group-title">
-                                        <span class={classes!("badge", format!("badge-scope-{group_badge}"))}>
-                                            { group_badge }
-                                        </span>
-                                        <h2 class="group-path">{ &group.group_path }</h2>
-                                    </div>
-                                    <span class="group-count">
-                                        { if group_count == 1 {
-                                            "1 repository".to_owned()
-                                        } else {
-                                            format!("{group_count} repositories")
-                                        } }
-                                    </span>
-                                </div>
-
-                                <div class="repo-list">
-                                    { for group.repositories.into_iter().map(|repo| {
-                                        let scope_badge = repo.scope_badge();
-                                        let vis_badge = repo.visibility_badge();
-                                        let canonical = repo.canonical_path.clone();
-                                        let clone_cmd = repo.clone_command_for(&active_ssh_host, active_user.as_deref());
-                                        let ssh_url = repo.ssh_url_for(&active_ssh_host, active_user.as_deref());
-
-                                        let clone_target = CopyTarget::CloneCommand(canonical.clone());
-                                        let ssh_target = CopyTarget::SshUrl(canonical.clone());
-
-                                        let is_clone_copied = *copied_target == Some(clone_target.clone());
-                                        let is_ssh_copied = *copied_target == Some(ssh_target.clone());
-
-                                        let clone_btn_label = copy_button_label(
-                                            (*copied_target).as_ref(),
-                                            &clone_target,
-                                            "Copy git clone",
-                                        );
-                                        let ssh_btn_label = copy_button_label(
-                                            (*copied_target).as_ref(),
-                                            &ssh_target,
-                                            "Copy SSH URL",
-                                        );
-
-                                        let on_copy_clone = {
-                                            let trigger_copy = trigger_copy.clone();
-                                            let clone_cmd = clone_cmd.clone();
-                                            let clone_target = clone_target.clone();
-                                            Callback::from(move |_: MouseEvent| {
-                                                trigger_copy.emit((clone_cmd.clone(), clone_target.clone()));
-                                            })
-                                        };
-
-                                        let on_copy_ssh = {
-                                            let trigger_copy = trigger_copy.clone();
-                                            let ssh_url = ssh_url.clone();
-                                            let ssh_target = ssh_target.clone();
-                                            Callback::from(move |_: MouseEvent| {
-                                                trigger_copy.emit((ssh_url.clone(), ssh_target.clone()));
-                                            })
-                                        };
-
-                                        html! {
-                                            <article class="repo-card" key={canonical.clone()}>
-                                                <div class="repo-card-main">
-                                                    <div class="repo-title-row">
-                                                        <span class="repo-name">{ format!("{}.git", repo.name) }</span>
-                                                        <span class={classes!("badge", format!("badge-scope-{scope_badge}"))}>
-                                                            { scope_badge }
-                                                        </span>
-                                                        <span class={classes!("badge", format!("badge-vis-{vis_badge}"))}>
-                                                            { vis_badge }
-                                                        </span>
-                                                    </div>
-                                                    <div class="repo-canonical-path">
-                                                        <code>{ &canonical }</code>
-                                                    </div>
-                                                    <div class="repo-command-preview">
-                                                        <code>{ &clone_cmd }</code>
-                                                    </div>
-                                                </div>
-
-                                                <div class="repo-card-actions">
-                                                    <button
-                                                        type="button"
-                                                        class={classes!("btn", "btn-copy", is_clone_copied.then_some("btn-copied"))}
-                                                        onclick={on_copy_clone}
-                                                        title={clone_cmd}
-                                                    >
-                                                        { clone_btn_label }
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        class={classes!("btn", "btn-copy", is_ssh_copied.then_some("btn-copied"))}
-                                                        onclick={on_copy_ssh}
-                                                        title={ssh_url}
-                                                    >
-                                                        { ssh_btn_label }
-                                                    </button>
-                                                </div>
-                                            </article>
-                                        }
-                                    }) }
-                                </div>
-                            </div>
-                        }
+                    { for groups.iter().map(|group| {
+                        render_repo_group(
+                            group,
+                            &active_ssh_host,
+                            active_user.as_deref(),
+                            (*copied_target).as_ref(),
+                            &trigger_copy,
+                        )
                     }) }
                 }
             </section>
 
             if *modal_open {
-                <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="ssh-modal-title">
-                    <div class="modal-panel">
-                        <div class="modal-header">
-                            <h2 id="ssh-modal-title">{ "Sign In with SSH Key (Stateless sshsig)" }</h2>
-                            <button
-                                type="button"
-                                class="btn btn-icon"
-                                onclick={on_close_sign_in.clone()}
-                                aria-label="Close modal"
-                            >
-                                { "×" }
-                            </button>
-                        </div>
-
-                        <form class="modal-body" onsubmit={on_verify_and_sign_in}>
-                            <p class="modal-intro">
-                                { "Sign a timestamped challenge locally with your SSH key using " }
-                                <code>{ "ssh-keygen -Y sign" }</code>
-                                { " to unlock private user and team repositories." }
-                            </p>
-
-                            <div class="modal-grid">
-                                <div class="filter-field">
-                                    <label for="ssh-username-input">{ "1. Linux / Git Username" }</label>
-                                    <input
-                                        id="ssh-username-input"
-                                        type="text"
-                                        placeholder="e.g. alice"
-                                        value={(*modal_username).clone()}
-                                        oninput={on_modal_username_input}
-                                        autocomplete="username"
-                                        required=true
-                                    />
-                                </div>
-
-                                <div class="filter-field">
-                                    <label for="ssh-ttl-select">{ "Token Lifetime (TTL)" }</label>
-                                    <select
-                                        id="ssh-ttl-select"
-                                        value={modal_ttl_secs.to_string()}
-                                        onchange={on_modal_ttl_change}
-                                    >
-                                        { for TTL_OPTIONS.iter().map(|opt| {
-                                            let selected = *modal_ttl_secs == opt.seconds;
-                                            html! {
-                                                <option value={opt.seconds.to_string()} selected={selected}>
-                                                    { opt.label }
-                                                </option>
-                                            }
-                                        }) }
-                                    </select>
-                                </div>
-                            </div>
-
-                            <div class="filter-field">
-                                <div class="label-with-action">
-                                    <label>{ "2. Run in your terminal to sign the challenge" }</label>
-                                    if let Ok(challenge) = &challenge_res {
-                                        <button
-                                            type="button"
-                                            class={classes!(
-                                                "btn",
-                                                "btn-copy",
-                                                "btn-sm",
-                                                (*copied_target == Some(CopyTarget::SignCommand)).then_some("btn-copied")
-                                            )}
-                                            onclick={{
-                                                let cmd = challenge.sign_command.clone();
-                                                let trigger_copy = trigger_copy.clone();
-                                                Callback::from(move |_: MouseEvent| {
-                                                    trigger_copy.emit((cmd.clone(), CopyTarget::SignCommand));
-                                                })
-                                            }}
-                                        >
-                                            { copy_button_label(
-                                                (*copied_target).as_ref(),
-                                                &CopyTarget::SignCommand,
-                                                "Copy Command",
-                                            ) }
-                                        </button>
-                                    }
-                                </div>
-
-                                <pre class="command-box">
-                                    <code>
-                                        { match &challenge_res {
-                                            Ok(challenge) => challenge.sign_command.clone(),
-                                            Err(_) => "Enter a valid username ([a-zA-Z0-9_-]+) above to generate your ssh-keygen command.".to_owned(),
-                                        } }
-                                    </code>
-                                </pre>
-                            </div>
-
-                            <div class="filter-field">
-                                <label for="ssh-signature-textarea">
-                                    { "3. Paste SSH Signature Output" }
-                                </label>
-                                <textarea
-                                    id="ssh-signature-textarea"
-                                    rows="6"
-                                    placeholder="-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----"
-                                    value={(*modal_signature).clone()}
-                                    oninput={on_modal_signature_input}
-                                    required=true
-                                />
-                            </div>
-
-                            if let Some(err) = (*modal_error).clone() {
-                                <div class="alert alert-error" role="alert">
-                                    <span>{ err }</span>
-                                </div>
-                            }
-
-                            <div class="modal-footer">
-                                <button
-                                    type="button"
-                                    class="btn btn-secondary"
-                                    onclick={on_close_sign_in}
-                                    disabled={*modal_verifying}
-                                >
-                                    { "Cancel" }
-                                </button>
-                                <button
-                                    type="submit"
-                                    class="btn btn-primary"
-                                    disabled={*modal_verifying || challenge_res.is_err() || modal_signature.trim().is_empty()}
-                                >
-                                    { if *modal_verifying { "Verifying..." } else { "Verify & Sign In" } }
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
+                { render_sign_in_modal(
+                    &modal_username,
+                    *modal_ttl_secs,
+                    &modal_signature,
+                    &challenge_res,
+                    (*modal_error).as_deref(),
+                    *modal_verifying,
+                    (*copied_target).as_ref(),
+                    &trigger_copy,
+                    on_modal_username_input,
+                    on_modal_ttl_change,
+                    on_modal_signature_input,
+                    on_verify_and_sign_in,
+                    on_close_sign_in,
+                ) }
             }
         </main>
     }
