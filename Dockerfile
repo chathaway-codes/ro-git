@@ -7,6 +7,7 @@ RUN pacman-key --init && \
     pacman -Syu --noconfirm --overwrite '*' \
         base-devel \
         git \
+        openssh \
         python \
         curl \
         protobuf \
