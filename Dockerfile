@@ -125,13 +125,14 @@ RUN apt-get update && \
         python3 \
         libssl3 && \
     rm -rf /var/lib/apt/lists/* && \
-    install -dm0755 -o root -g root /users /teams /run/sshd /app/dist
+    install -dm0755 -o root -g root /users /teams /run/sshd /app/dist /usr/local/share/ro-git
 
 COPY --from=builder --chmod=0755 /build/target/release/ro-git-server /usr/local/bin/ro-git-server
 COPY --from=builder /build/dist /app/dist
 COPY --chmod=0755 scripts/git-auto-shell /usr/local/bin/git-auto-shell
 COPY --chmod=0755 scripts/git-sync-users /usr/local/bin/git-sync-users
 COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0644 config/sshd_config /usr/local/share/ro-git/sshd_config
 COPY --chmod=0644 config/sshd_config /etc/ssh/sshd_config
 
 ENV RO_GIT_LISTEN_ADDR=0.0.0.0:8080 \

@@ -1179,8 +1179,10 @@ pub fn spawn_worker_subprocess(worker_bin: &Path, req_bytes: &[u8]) -> Result<Ve
 /// subprocess (if the `ro-git-server` binary is available) or executes it directly.
 pub fn dispatch_worker_request(req_bytes: &[u8]) -> Result<Vec<u8>, GrpcStatus<'static>> {
     if let Some(worker_bin) = find_worker_binary() {
-        spawn_worker_subprocess(&worker_bin, req_bytes)
-            .map_err(|_| GrpcStatus::internal("git-worker subprocess execution failed"))
+        spawn_worker_subprocess(&worker_bin, req_bytes).map_err(|err| {
+            eprintln!("git-worker error: {err}");
+            GrpcStatus::internal("git-worker subprocess execution failed")
+        })
     } else {
         Ok(execute_worker_request_bytes(req_bytes))
     }
