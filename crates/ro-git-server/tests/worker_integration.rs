@@ -10,9 +10,7 @@ use ro_git_proto::ro_git::v1::{
 use ro_git_proto::{
     encode_bearer_token, format_token_payload, API_REPOSITORIES_PATH, SSH_SIG_NAMESPACE,
 };
-use ro_git_server::{
-    resolve_user_credentials, spawn_worker_subprocess, GitServiceHandler, ServerConfig,
-};
+use ro_git_server::{spawn_worker_subprocess, GitServiceHandler, ServerConfig};
 use roto::runtime::BackwardWriter;
 use roto_grpc::http::{HttpMethod, HttpRequest};
 use roto_grpc::RpcContext;
@@ -103,8 +101,6 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
     let pem = sig.to_pem(LineEnding::LF).unwrap();
     let token = encode_bearer_token(&payload, &pem).unwrap();
 
-    let alice_creds = resolve_user_credentials(&root, None, Some("alice"), 65_534).unwrap();
-
     // 1. Spawn `ro-git-server git-worker` subprocess for ListRepositories
     let mut req_buf = [0u8; 2048];
     let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
@@ -117,8 +113,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_token(&token);
     let req_bytes = req_builder.finish().unwrap();
 
-    let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_bytes).expect("spawn git-worker");
+    let resp_bytes = spawn_worker_subprocess(&worker_bin, req_bytes).expect("spawn git-worker");
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
 
@@ -284,7 +279,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_root_dir(&root.to_string_lossy())
         .write_token(&token);
     let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+        spawn_worker_subprocess(&worker_bin, req_builder.finish().unwrap()).unwrap();
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
     let head_oid = match resp_view.result().unwrap() {
@@ -316,7 +311,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_root_dir(&root.to_string_lossy())
         .write_token(&token);
     let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+        spawn_worker_subprocess(&worker_bin, req_builder.finish().unwrap()).unwrap();
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
     match resp_view.result().unwrap() {
@@ -346,7 +341,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_root_dir(&root.to_string_lossy())
         .write_token(&token);
     let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+        spawn_worker_subprocess(&worker_bin, req_builder.finish().unwrap()).unwrap();
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
     match resp_view.result().unwrap() {
@@ -374,7 +369,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_root_dir(&root.to_string_lossy())
         .write_token(&token);
     let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+        spawn_worker_subprocess(&worker_bin, req_builder.finish().unwrap()).unwrap();
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
     match resp_view.result().unwrap() {
@@ -400,7 +395,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         .write_root_dir(&root.to_string_lossy())
         .write_token(&token);
     let resp_bytes =
-        spawn_worker_subprocess(&worker_bin, &alice_creds, req_builder.finish().unwrap()).unwrap();
+        spawn_worker_subprocess(&worker_bin, req_builder.finish().unwrap()).unwrap();
     let resp_view = WorkerResponseView::from_bytes(&resp_bytes).unwrap();
     assert_eq!(resp_view.status_code().unwrap(), 0);
     match resp_view.result().unwrap() {

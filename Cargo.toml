@@ -18,7 +18,7 @@ roto-grpc = { git = "https://github.com/chathaway-codes/roto", default-features 
 google-protobuf-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
 grpc-reflection-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
 ro-git-proto = { path = "crates/ro-git-proto", default-features = false }
-libc = { version = "0.2", default-features = false }
+nix = { version = "0.31", default-features = false }
 ssh-key = { version = "0.6.7", default-features = false }
 yew = { version = "0.21", default-features = false }
 wasm-bindgen = { version = "=0.2.128", default-features = false }

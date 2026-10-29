@@ -15,5 +15,5 @@ roto.workspace = true
 roto-runtime.workspace = true
 roto-grpc = { workspace = true, features = ["std", "tokio"] }
 grpc-reflection-roto = { workspace = true, features = ["std", "tokio"] }
-libc = { workspace = true }
+nix = { workspace = true, features = ["user"] }
 ssh-key = { workspace = true, features = ["alloc", "ed25519", "rsa", "std"] }

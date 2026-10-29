@@ -2,19 +2,20 @@
 //! OpenSSH `SSHSIG` stateless token verification, user/team credential resolution,
 //! and privilege-separated `git-worker` IPC and repository discovery.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use nix::unistd::{geteuid, setgid, setgroups, setuid, Gid, Uid};
 
 use ro_git_proto::grpc::ro_git::v1::git_service::{GitService, GitServiceServer};
 use ro_git_proto::ro_git::v1::{
@@ -509,7 +510,6 @@ fn collect_filesystem_team_memberships(
     }
 }
 
-#[allow(unsafe_code)]
 fn resolve_or_fallback_dev_credentials(
     root_dir: &Path,
     etc_dir: Option<&Path>,
@@ -522,8 +522,9 @@ fn resolve_or_fallback_dev_credentials(
     Ok(
         resolve_user_credentials(root_dir, etc_dir, Some(username), nobody_uid).unwrap_or_else(
             |_| {
-                // SAFETY: `geteuid` and `getegid` are thread-safe POSIX syscalls with no preconditions.
-                let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                let (uid, gid) = fs::symlink_metadata("/proc/self")
+                    .map(|meta| (meta.uid(), meta.gid()))
+                    .unwrap_or((nobody_uid, nobody_uid));
                 UserCredentials {
                     username: Some(username.to_owned()),
                     uid,
@@ -861,6 +862,10 @@ fn encode_worker_ok(
 /// the serialized `WorkerResponse` protobuf payload.
 #[must_use]
 pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
+    execute_worker_request(req_bytes, false)
+}
+
+fn execute_worker_request(req_bytes: &[u8], drop_privileges: bool) -> Vec<u8> {
     let Ok(req_view) = WorkerRequestView::from_bytes(req_bytes) else {
         return encode_worker_error(GrpcCode::InvalidArgument, "malformed WorkerRequest payload");
     };
@@ -903,6 +908,12 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
             team_names: Vec::new(),
         }
     };
+
+    if drop_privileges {
+        if let Err(err) = drop_worker_privileges(creds.uid, creds.gid, &creds.supplementary_gids) {
+            return encode_worker_error(GrpcCode::Internal, &err);
+        }
+    }
 
     match req_view.command() {
         Ok(Some(worker_request::Command::GetAuthStatus(_))) => {
@@ -1071,7 +1082,7 @@ pub fn run_worker_stdio() -> Result<(), String> {
         .read_to_end(&mut input)
         .map_err(|err| format!("failed to read WorkerRequest from stdin: {err}"))?;
 
-    let output = execute_worker_request_bytes(&input);
+    let output = execute_worker_request(&input, true);
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(&output)
@@ -1116,38 +1127,29 @@ pub fn find_worker_binary() -> Option<PathBuf> {
     None
 }
 
-/// Spawns `ro-git-server git-worker` as a subprocess, dropping privileges to `creds`
-/// when running as `root` (`geteuid() == 0`), sending `req_bytes` over `stdin`, and
-/// returning the raw `WorkerResponse` bytes from `stdout`.
-#[allow(unsafe_code)]
-pub fn spawn_worker_subprocess(
-    worker_bin: &Path,
-    creds: &UserCredentials,
-    req_bytes: &[u8],
-) -> Result<Vec<u8>, String> {
-    let mut cmd = Command::new(worker_bin);
-    cmd.arg("git-worker")
+fn drop_worker_privileges(uid: u32, gid: u32, supplementary_gids: &[u32]) -> Result<(), String> {
+    if !geteuid().is_root() {
+        return Ok(());
+    }
+    let groups: Vec<Gid> = supplementary_gids
+        .iter()
+        .copied()
+        .map(Gid::from_raw)
+        .collect();
+    setgroups(&groups).map_err(|err| format!("setgroups failed: {err}"))?;
+    setgid(Gid::from_raw(gid)).map_err(|err| format!("setgid failed: {err}"))?;
+    setuid(Uid::from_raw(uid)).map_err(|err| format!("setuid failed: {err}"))?;
+    Ok(())
+}
+
+/// Spawns `ro-git-server git-worker` as a subprocess, sending `req_bytes` over `stdin`
+/// and returning the raw `WorkerResponse` bytes from `stdout`.
+pub fn spawn_worker_subprocess(worker_bin: &Path, req_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut child = Command::new(worker_bin)
+        .arg("git-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // SAFETY: `geteuid` has no preconditions. When running as root (`UID 0`), drop
-    // supplementary groups, primary GID, and UID in the child process before exec.
-    if unsafe { libc::geteuid() == 0 } {
-        let gids: Vec<libc::gid_t> = creds.supplementary_gids.clone();
-        cmd.uid(creds.uid).gid(creds.gid);
-        unsafe {
-            cmd.pre_exec(move || {
-                let rc = libc::setgroups(gids.len(), gids.as_ptr());
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let mut child = cmd
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("failed to spawn git-worker subprocess: {err}"))?;
 
@@ -1175,12 +1177,9 @@ pub fn spawn_worker_subprocess(
 
 /// Dispatches a serialized `WorkerRequest` to a privilege-separated `git-worker`
 /// subprocess (if the `ro-git-server` binary is available) or executes it directly.
-pub fn dispatch_worker_request(
-    creds: &UserCredentials,
-    req_bytes: &[u8],
-) -> Result<Vec<u8>, GrpcStatus<'static>> {
+pub fn dispatch_worker_request(req_bytes: &[u8]) -> Result<Vec<u8>, GrpcStatus<'static>> {
     if let Some(worker_bin) = find_worker_binary() {
-        spawn_worker_subprocess(&worker_bin, creds, req_bytes)
+        spawn_worker_subprocess(&worker_bin, req_bytes)
             .map_err(|_| GrpcStatus::internal("git-worker subprocess execution failed"))
     } else {
         Ok(execute_worker_request_bytes(req_bytes))
@@ -1229,7 +1228,7 @@ impl GitServiceHandler {
     fn resolve_request_auth<'a>(
         &self,
         meta: &RpcMetadata<'a>,
-    ) -> Result<(Option<String>, Option<String>, UserCredentials), GrpcStatus<'static>> {
+    ) -> Result<(Option<String>, Option<String>), GrpcStatus<'static>> {
         let root_path = Path::new(&self.config.root_dir);
         let now_secs = current_unix_secs();
 
@@ -1247,14 +1246,14 @@ impl GitServiceHandler {
                 .map_err(|_| {
                     GrpcStatus::unauthenticated("invalid or expired SSH signature bearer token")
                 })?;
-                let creds = resolve_user_credentials(
+                resolve_user_credentials(
                     root_path,
                     None,
                     Some(&username),
                     self.config.nobody_uid,
                 )
                 .map_err(|_| GrpcStatus::unauthenticated("unable to resolve user credentials"))?;
-                return Ok((Some(auth_str.to_owned()), None, creds));
+                return Ok((Some(auth_str.to_owned()), None));
             }
         }
 
@@ -1266,7 +1265,7 @@ impl GitServiceHandler {
                     })?
                     .trim();
                 if !proxy_user.is_empty() {
-                    let creds = resolve_or_fallback_dev_credentials(
+                    resolve_or_fallback_dev_credentials(
                         root_path,
                         None,
                         proxy_user,
@@ -1275,25 +1274,25 @@ impl GitServiceHandler {
                     .map_err(|_| {
                         GrpcStatus::unauthenticated("invalid proxy user header identifier")
                     })?;
-                    return Ok((None, Some(proxy_user.to_owned()), creds));
+                    return Ok((None, Some(proxy_user.to_owned())));
                 }
             }
         }
 
         if let Some(ref dev_user) = self.config.dev_user {
-            let creds = resolve_or_fallback_dev_credentials(
+            resolve_or_fallback_dev_credentials(
                 root_path,
                 None,
                 dev_user,
                 self.config.nobody_uid,
             )
             .map_err(|_| GrpcStatus::unauthenticated("invalid RO_GIT_DEV_USER identifier"))?;
-            return Ok((None, Some(dev_user.clone()), creds));
+            return Ok((None, Some(dev_user.clone())));
         }
 
-        let creds = resolve_user_credentials(root_path, None, None, self.config.nobody_uid)
+        resolve_user_credentials(root_path, None, None, self.config.nobody_uid)
             .map_err(|_| GrpcStatus::internal("failed to resolve anonymous credentials"))?;
-        Ok((None, None, creds))
+        Ok((None, None))
     }
 
     fn execute_worker_command<'a>(
@@ -1301,7 +1300,7 @@ impl GitServiceHandler {
         meta: &RpcMetadata<'a>,
         write_command: impl FnOnce(&mut WorkerRequestBuilder<'_>),
     ) -> Result<Vec<u8>, GrpcStatus<'static>> {
-        let (token, preauth, creds) = self.resolve_request_auth(meta)?;
+        let (token, preauth) = self.resolve_request_auth(meta)?;
         let now_secs = current_unix_secs();
 
         let mut req_buf = [0u8; 4096];
@@ -1322,7 +1321,7 @@ impl GitServiceHandler {
             .finish()
             .map_err(|_| GrpcStatus::resource_exhausted("worker request buffer exhausted"))?;
 
-        let resp_bytes = dispatch_worker_request(&creds, req_bytes)?;
+        let resp_bytes = dispatch_worker_request(req_bytes)?;
         let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
             .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
 
