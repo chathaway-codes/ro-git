@@ -1205,10 +1205,13 @@ dependencies = [
 name = "ro-git-ui"
 version = "0.1.0"
 dependencies = [
+ "gloo-timers 0.3.0",
+ "js-sys",
  "ro-git-proto",
  "roto",
  "roto-runtime",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "yew",
 ]

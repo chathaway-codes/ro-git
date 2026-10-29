@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Yew WASM frontend for ro-git"
 
+[lib]
+name = "ro_git_ui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ro-git-ui"
 path = "src/main.rs"
@@ -13,6 +17,22 @@ path = "src/main.rs"
 ro-git-proto.workspace = true
 roto.workspace = true
 roto-runtime.workspace = true
-yew = { version = "0.21", features = ["csr"] }
-wasm-bindgen = "=0.2.128"
-web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard", "Storage"] }
+yew = { workspace = true, features = ["csr"] }
+wasm-bindgen = { workspace = true, features = ["std"] }
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+gloo-timers.workspace = true
+web-sys = { workspace = true, features = [
+    "Clipboard",
+    "Headers",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "Location",
+    "Navigator",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Storage",
+    "Window",
+] }
