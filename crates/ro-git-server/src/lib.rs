@@ -1316,10 +1316,12 @@ impl GitService for GitServiceHandler {
         let owner = req.owner().unwrap_or("");
         let visibility = req.visibility().unwrap_or("");
         let name = req.name().unwrap_or("");
+        let revision = req.revision().unwrap_or("");
 
         self.execute_worker_command(meta, |req_builder| {
             req_builder.write_get_repository(|gr| {
-                gr.write_name(name)
+                gr.write_revision(revision)
+                    .write_name(name)
                     .write_visibility(visibility)
                     .write_owner(owner)
                     .write_scope(scope);

@@ -185,15 +185,19 @@ pub fn normalize_revision(revision: &str) -> &str {
 #[must_use]
 pub fn is_valid_revision(revision: &str) -> bool {
     if revision.is_empty()
+        || revision == "@"
         || revision.starts_with('-')
         || revision.starts_with('/')
-        || revision.starts_with('.')
         || revision.ends_with('/')
-        || revision.ends_with('.')
-        || revision.ends_with(".lock")
         || revision.contains("..")
         || revision.contains("//")
         || revision.contains("@{")
+    {
+        return false;
+    }
+    if revision
+        .split('/')
+        .any(|seg| seg.starts_with('.') || seg.ends_with('.') || seg.ends_with(".lock"))
     {
         return false;
     }
@@ -733,9 +737,13 @@ mod tests {
         assert!(!is_valid_revision("-n"));
         assert!(!is_valid_revision("/main"));
         assert!(!is_valid_revision("main/"));
+        assert!(!is_valid_revision("@"));
         assert!(!is_valid_revision(".hidden"));
+        assert!(!is_valid_revision("refs/heads/.hidden"));
         assert!(!is_valid_revision("main."));
+        assert!(!is_valid_revision("feature/branch./sub"));
         assert!(!is_valid_revision("main.lock"));
+        assert!(!is_valid_revision("feature/branch.lock/sub"));
         assert!(!is_valid_revision("a..b"));
         assert!(!is_valid_revision("a//b"));
         assert!(!is_valid_revision("HEAD@{1}"));
@@ -1215,7 +1223,7 @@ mod tests {
         let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
         req_builder
             .write_list_repositories(|lr| {
-                lr.write_scope("users").write_owner("alice");
+                lr.write_owner("alice").write_scope("users");
             })
             .write_now_unix_secs(1_700_000_000)
             .write_max_token_ttl_secs(2_592_000)
