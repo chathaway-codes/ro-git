@@ -24,3 +24,5 @@
 
 ## Language Best Practices & Conventions
 <!-- Document language-specific idioms and conventions agreed upon with the user during code reviews -->
+- **POSIX Shell (`#!/bin/sh`)**: Use `set -e`, avoid bashisms, quote all variable expansions, use `printf '%s\n'` instead of `echo` for arbitrary strings, guard path arguments with `--`, and redirect any diagnostic/init output to `stderr` (`>&2`) to preserve wire protocols and the Rule of Silence.
+- **Python 3**: Rely strictly on the standard library (`from __future__ import annotations`, `pathlib.Path` with explicit `encoding="utf-8"`, `unittest`), reject symlinks when reconciling privileged directories/files (`follow_symlinks=False`), and perform atomic file updates via `tempfile.mkstemp` + `os.replace`.
