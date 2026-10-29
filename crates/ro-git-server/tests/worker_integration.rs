@@ -110,6 +110,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
     let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
     req_builder
         .write_list_repositories(|_| {})
+        .write_https_host("git.corp.local")
         .write_now_unix_secs(now)
         .write_max_token_ttl_secs(max_ttl)
         .write_ssh_host("git.corp.local:2222")
@@ -125,10 +126,9 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
         Some(worker_response::Result::ListRepositories(list_view)) => {
             assert_eq!(list_view.authenticated_user().unwrap(), "alice");
             assert_eq!(list_view.ssh_host().unwrap(), "git.corp.local:2222");
-            let paths: Vec<_> = list_view
-                .repositories()
-                .map(|r| r.unwrap().canonical_path().unwrap())
-                .collect();
+            assert_eq!(list_view.https_host().unwrap(), "git.corp.local");
+            let repos: Vec<_> = list_view.repositories().map(|r| r.unwrap()).collect();
+            let paths: Vec<_> = repos.iter().map(|r| r.canonical_path().unwrap()).collect();
             assert_eq!(
                 paths,
                 vec![
@@ -138,6 +138,15 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
                     "/users/alice/public/notes.git",
                     "/users/bob/public/tools.git",
                 ]
+            );
+            assert_eq!(repos[0].https_url().unwrap(), "");
+            assert_eq!(
+                repos[1].https_url().unwrap(),
+                "https://git.corp.local/teams/platform/public/sdk.git"
+            );
+            assert_eq!(
+                repos[1].https_clone_command().unwrap(),
+                "git clone https://git.corp.local/teams/platform/public/sdk.git"
             );
         }
         other => panic!("expected ListRepositories, got {other:?}"),
@@ -162,6 +171,7 @@ fn git_worker_subprocess_executes_auth_status_and_repository_discovery() {
     let server = GitServiceHandler::new(ServerConfig {
         root_dir: root.to_string_lossy().into_owned(),
         ssh_host: String::from("git.corp.local:2222"),
+        https_host: String::from("git.corp.local"),
         ..ServerConfig::default()
     })
     .into_server();

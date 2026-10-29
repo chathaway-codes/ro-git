@@ -19,8 +19,8 @@ use ro_git_proto::{
 use yew::prelude::*;
 
 use crate::{
-    copy_button_label, normalize_repo_path, CopyTarget, MarkdownContext, MarkdownProps,
-    MarkdownView, RepositoryItem, DEFAULT_SSH_HOST,
+    copy_button_label, normalize_repo_path, CloneProtocol, CopyTarget, MarkdownContext,
+    MarkdownProps, MarkdownView, RepositoryItem, DEFAULT_SSH_HOST,
 };
 
 /// Default commit log page size requested from `ListCommits`.
@@ -1276,6 +1276,14 @@ pub fn decode_get_repository_response(bytes: &[u8]) -> Result<RepositoryOverview
         .clone_command()
         .map_err(|e| format!("invalid repository.clone_command: {e:?}"))?
         .trim();
+    let https_url = repo_view
+        .https_url()
+        .map_err(|e| format!("invalid repository.https_url: {e:?}"))?
+        .trim();
+    let https_clone_command = repo_view
+        .https_clone_command()
+        .map_err(|e| format!("invalid repository.https_clone_command: {e:?}"))?
+        .trim();
 
     let mut repository =
         RepositoryItem::new(DEFAULT_SSH_HOST, None, scope, owner, visibility, name);
@@ -1287,6 +1295,12 @@ pub fn decode_get_repository_response(bytes: &[u8]) -> Result<RepositoryOverview
     }
     if !clone_command.is_empty() {
         repository.clone_command = clone_command.to_owned();
+    }
+    if !https_url.is_empty() {
+        repository.https_url = https_url.to_owned();
+    }
+    if !https_clone_command.is_empty() {
+        repository.https_clone_command = https_clone_command.to_owned();
     }
 
     let head_ref = view
@@ -1484,8 +1498,52 @@ fn make_nav_click(on_navigate: &Callback<AppRoute>, target: AppRoute) -> Callbac
     })
 }
 
+/// Renders the `SSH` / `HTTPS` clone protocol toggle buttons for public repositories.
+#[allow(clippy::double_must_use)]
+#[must_use]
+pub fn render_clone_protocol_toggle(
+    clone_protocol: CloneProtocol,
+    on_protocol_change: &Callback<CloneProtocol>,
+) -> Html {
+    html! {
+        <div class="clone-protocol-toggle" role="group" aria-label="Clone Protocol">
+            <button
+                type="button"
+                class={classes!(
+                    "btn",
+                    "btn-sm",
+                    "toggle-btn",
+                    (clone_protocol == CloneProtocol::Ssh).then_some("toggle-btn-active")
+                )}
+                onclick={{
+                    let on_protocol_change = on_protocol_change.clone();
+                    Callback::from(move |_: MouseEvent| on_protocol_change.emit(CloneProtocol::Ssh))
+                }}
+            >
+                { "SSH" }
+            </button>
+            <button
+                type="button"
+                class={classes!(
+                    "btn",
+                    "btn-sm",
+                    "toggle-btn",
+                    (clone_protocol == CloneProtocol::Https).then_some("toggle-btn-active")
+                )}
+                onclick={{
+                    let on_protocol_change = on_protocol_change.clone();
+                    Callback::from(move |_: MouseEvent| on_protocol_change.emit(CloneProtocol::Https))
+                }}
+            >
+                { "HTTPS" }
+            </button>
+        </div>
+    }
+}
+
 /// Renders the repository header (`scope / owner / visibility / name`, visibility badge,
-/// `git clone` snippet, Branch & Tag selector `<select>`, and `Tree` / `Commits` tabs).
+/// `SSH` / `HTTPS` protocol toggle for public repos, `git clone` snippet, Branch & Tag
+/// selector `<select>`, and `Tree` / `Commits` tabs).
 #[allow(clippy::too_many_arguments, clippy::double_must_use)]
 #[must_use]
 pub fn render_repository_header(
@@ -1494,7 +1552,10 @@ pub fn render_repository_header(
     active_revision: &str,
     is_commits_tab: bool,
     ssh_host: &str,
+    https_host: &str,
     auth_user: Option<&str>,
+    clone_protocol: CloneProtocol,
+    on_protocol_change: &Callback<CloneProtocol>,
     copied_target: Option<&CopyTarget>,
     trigger_copy: &Callback<(String, CopyTarget)>,
     on_navigate: &Callback<AppRoute>,
@@ -1514,33 +1575,63 @@ pub fn render_repository_header(
         });
 
     let canonical = item.canonical_path.clone();
-    let clone_cmd = item.clone_command_for(ssh_host, auth_user);
-    let ssh_url = item.ssh_url_for(ssh_host, auth_user);
+    let is_public = item.is_public();
+    let use_https = is_public && clone_protocol == CloneProtocol::Https;
+
+    let (active_cmd, active_url, cmd_target, url_target, cmd_default_label, url_default_label) =
+        if use_https {
+            let cmd = if !item.https_clone_command.is_empty() && https_host.trim().is_empty() {
+                item.https_clone_command.clone()
+            } else {
+                item.https_clone_command_for(https_host)
+            };
+            let url = if !item.https_url.is_empty() && https_host.trim().is_empty() {
+                item.https_url.clone()
+            } else {
+                item.https_url_for(https_host)
+            };
+            (
+                cmd,
+                url,
+                CopyTarget::HttpsCloneCommand(canonical.clone()),
+                CopyTarget::HttpsUrl(canonical),
+                "Copy HTTPS clone",
+                "Copy HTTPS URL",
+            )
+        } else {
+            (
+                item.clone_command_for(ssh_host, auth_user),
+                item.ssh_url_for(ssh_host, auth_user),
+                CopyTarget::CloneCommand(canonical.clone()),
+                CopyTarget::SshUrl(canonical),
+                "Copy git clone",
+                "Copy SSH URL",
+            )
+        };
+
     let scope_badge = repo.scope_badge();
     let vis_badge = repo.visibility_badge();
 
-    let clone_target = CopyTarget::CloneCommand(canonical.clone());
-    let ssh_target = CopyTarget::SshUrl(canonical);
-    let is_clone_copied = copied_target == Some(&clone_target);
-    let is_ssh_copied = copied_target == Some(&ssh_target);
-    let clone_btn_label = copy_button_label(copied_target, &clone_target, "Copy git clone");
-    let ssh_btn_label = copy_button_label(copied_target, &ssh_target, "Copy SSH URL");
+    let is_cmd_copied = copied_target == Some(&cmd_target);
+    let is_url_copied = copied_target == Some(&url_target);
+    let cmd_btn_label = copy_button_label(copied_target, &cmd_target, cmd_default_label);
+    let url_btn_label = copy_button_label(copied_target, &url_target, url_default_label);
 
-    let on_copy_clone = {
+    let on_copy_cmd = {
         let trigger_copy = trigger_copy.clone();
-        let clone_cmd = clone_cmd.clone();
-        let clone_target = clone_target.clone();
+        let active_cmd = active_cmd.clone();
+        let cmd_target = cmd_target.clone();
         Callback::from(move |_: MouseEvent| {
-            trigger_copy.emit((clone_cmd.clone(), clone_target.clone()));
+            trigger_copy.emit((active_cmd.clone(), cmd_target.clone()));
         })
     };
 
-    let on_copy_ssh = {
+    let on_copy_url = {
         let trigger_copy = trigger_copy.clone();
-        let ssh_url = ssh_url.clone();
-        let ssh_target = ssh_target.clone();
+        let active_url = active_url.clone();
+        let url_target = url_target.clone();
         Callback::from(move |_: MouseEvent| {
-            trigger_copy.emit((ssh_url.clone(), ssh_target.clone()));
+            trigger_copy.emit((active_url.clone(), url_target.clone()));
         })
     };
 
@@ -1604,22 +1695,25 @@ pub fn render_repository_header(
                     </div>
 
                     <div class="repo-clone-bar">
-                        <code class="repo-clone-snippet">{ &clone_cmd }</code>
+                        if is_public {
+                            { render_clone_protocol_toggle(clone_protocol, on_protocol_change) }
+                        }
+                        <code class="repo-clone-snippet">{ &active_cmd }</code>
                         <button
                             type="button"
-                            class={classes!("btn", "btn-copy", "btn-sm", is_clone_copied.then_some("btn-copied"))}
-                            onclick={on_copy_clone}
-                            title={clone_cmd}
+                            class={classes!("btn", "btn-copy", "btn-sm", is_cmd_copied.then_some("btn-copied"))}
+                            onclick={on_copy_cmd}
+                            title={active_cmd}
                         >
-                            { clone_btn_label }
+                            { cmd_btn_label }
                         </button>
                         <button
                             type="button"
-                            class={classes!("btn", "btn-copy", "btn-sm", is_ssh_copied.then_some("btn-copied"))}
-                            onclick={on_copy_ssh}
-                            title={ssh_url}
+                            class={classes!("btn", "btn-copy", "btn-sm", is_url_copied.then_some("btn-copied"))}
+                            onclick={on_copy_url}
+                            title={active_url}
                         >
-                            { ssh_btn_label }
+                            { url_btn_label }
                         </button>
                     </div>
                 </div>
@@ -2633,17 +2727,29 @@ mod tests {
             .write_head_oid(OID_A)
             .write_head_ref("main")
             .write_repository(|r| {
-                r.write_clone_command("git clone ssh://localhost/users/alice/public/demo.git")
-                    .write_ssh_url("ssh://localhost/users/alice/public/demo.git")
-                    .write_canonical_path("/users/alice/public/demo.git")
-                    .write_name("demo")
-                    .write_visibility("public")
-                    .write_owner("alice")
-                    .write_scope("users");
+                r.write_https_clone_command(
+                    "git clone https://git.example.com/users/alice/public/demo.git",
+                )
+                .write_https_url("https://git.example.com/users/alice/public/demo.git")
+                .write_clone_command("git clone ssh://localhost/users/alice/public/demo.git")
+                .write_ssh_url("ssh://localhost/users/alice/public/demo.git")
+                .write_canonical_path("/users/alice/public/demo.git")
+                .write_name("demo")
+                .write_visibility("public")
+                .write_owner("alice")
+                .write_scope("users");
             });
         let gr_bytes = gr.finish().unwrap();
         let overview = decode_get_repository_response(gr_bytes).unwrap();
         assert_eq!(overview.repository.name, "demo");
+        assert_eq!(
+            overview.repository.https_url,
+            "https://git.example.com/users/alice/public/demo.git"
+        );
+        assert_eq!(
+            overview.repository.https_clone_command,
+            "git clone https://git.example.com/users/alice/public/demo.git"
+        );
         assert_eq!(overview.head_ref, "main");
         assert_eq!(overview.effective_revision(), "main");
         assert!(!overview.is_empty_unborn());
@@ -2843,23 +2949,75 @@ mod tests {
         let noop_md_nav = Callback::from(|_: String| {});
         let noop_copy = Callback::from(|_: (String, CopyTarget)| {});
         let noop_rev = Callback::from(|_: Event| {});
+        let noop_proto = Callback::from(|_: CloneProtocol| {});
 
-        // Header VNode
+        // Header VNode (Public repo in SSH mode)
         let header_vnode = render_repository_header(
             &repo,
             None,
             "main",
             false,
             "git.example.com",
+            "https://git.example.com",
             Some("alice"),
+            CloneProtocol::Ssh,
+            &noop_proto,
+            None,
+            &noop_copy,
+            &noop_nav,
+            noop_rev.clone(),
+        );
+        let header_html = render_vnode_to_html_string(&header_vnode);
+        assert!(header_html.contains("demo.git"));
+        assert!(header_html.contains("clone-protocol-toggle"));
+        assert!(header_html.contains("git clone ssh://alice@git.example.com/users/alice/public/demo.git"));
+        assert!(header_html.contains("Copy git clone"));
+        assert!(header_html.contains("Copy SSH URL"));
+
+        // Header VNode (Public repo in HTTPS mode)
+        let https_header_vnode = render_repository_header(
+            &repo,
+            None,
+            "main",
+            false,
+            "git.example.com",
+            "https://git.example.com",
+            Some("alice"),
+            CloneProtocol::Https,
+            &noop_proto,
+            None,
+            &noop_copy,
+            &noop_nav,
+            noop_rev.clone(),
+        );
+        let https_header_html = render_vnode_to_html_string(&https_header_vnode);
+        assert!(https_header_html.contains("clone-protocol-toggle"));
+        assert!(https_header_html.contains("git clone https://git.example.com/users/alice/public/demo.git"));
+        assert!(https_header_html.contains("Copy HTTPS clone"));
+        assert!(https_header_html.contains("Copy HTTPS URL"));
+
+        // Header VNode (Private repo always uses SSH and omits protocol toggle)
+        let priv_repo = RepoCoordinates::new("teams", "core", "private", "infra").unwrap();
+        let priv_header_vnode = render_repository_header(
+            &priv_repo,
+            None,
+            "main",
+            false,
+            "git.example.com",
+            "https://git.example.com",
+            Some("alice"),
+            CloneProtocol::Https,
+            &noop_proto,
             None,
             &noop_copy,
             &noop_nav,
             noop_rev,
         );
-        let header_html = render_vnode_to_html_string(&header_vnode);
-        assert!(header_html.contains("demo.git"));
-        assert!(header_html.contains("git clone ssh://alice@git.example.com/users/alice/public/demo.git"));
+        let priv_header_html = render_vnode_to_html_string(&priv_header_vnode);
+        assert!(!priv_header_html.contains("clone-protocol-toggle"));
+        assert!(priv_header_html.contains("git clone ssh://alice@git.example.com/teams/core/private/infra.git"));
+        assert!(priv_header_html.contains("Copy git clone"));
+        assert!(priv_header_html.contains("Copy SSH URL"));
 
         // Tree view in subdirectory with `..` parent link and README panel
         let entries = vec![

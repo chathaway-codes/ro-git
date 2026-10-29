@@ -242,6 +242,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
         listen_addr: String::from("127.0.0.1:0"),
         root_dir: root_dir.path().to_string_lossy().into_owned(),
         ssh_host: String::from("git.example.com"),
+        https_host: String::from("git.example.com"),
         static_dir: static_dir.path().to_string_lossy().into_owned(),
         max_token_ttl_secs: 2_592_000,
         nobody_uid: 65_534,
@@ -280,6 +281,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
     assert!(!auth_view.authenticated().unwrap());
     assert_eq!(auth_view.username().unwrap_or(""), "");
     assert_eq!(auth_view.ssh_host().unwrap(), "git.example.com");
+    assert_eq!(auth_view.https_host().unwrap(), "git.example.com");
 
     let req_bytes = ListRepositoriesRequestBuilder::new(&mut req_buf)
         .finish()
@@ -288,6 +290,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
         .list_repositories(req_bytes)
         .expect("anonymous gRPC ListRepositories");
     assert_eq!(list_view.authenticated_user().unwrap_or(""), "");
+    assert_eq!(list_view.https_host().unwrap(), "git.example.com");
     let anon_paths: Vec<String> = list_view
         .repositories()
         .map(|r| r.unwrap().canonical_path().unwrap().to_owned())
@@ -299,6 +302,15 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
             "/users/alice/public/dotfiles.git",
             "/users/bob/public/blog.git",
         ]
+    );
+    let first_anon_repo = list_view.repositories().next().unwrap().unwrap();
+    assert_eq!(
+        first_anon_repo.https_url().unwrap(),
+        "https://git.example.com/teams/core/public/ro-git.git"
+    );
+    assert_eq!(
+        first_anon_repo.https_clone_command().unwrap(),
+        "git clone https://git.example.com/teams/core/public/ro-git.git"
     );
 
     // 1b. Authenticated gRPC with Authorization: Bearer <token>
@@ -312,6 +324,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
     assert!(auth_view.authenticated().unwrap());
     assert_eq!(auth_view.username().unwrap(), "alice");
     assert_eq!(auth_view.ssh_host().unwrap(), "git.example.com");
+    assert_eq!(auth_view.https_host().unwrap(), "git.example.com");
 
     client
         .insert_metadata("authorization", &bearer_alice)
@@ -320,7 +333,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
         .list_repositories(req_bytes)
         .expect("authenticated gRPC ListRepositories");
     assert_eq!(list_view.authenticated_user().unwrap(), "alice");
-    let alice_repos: Vec<(String, String, String)> = list_view
+    let alice_repos: Vec<(String, String, String, String, String)> = list_view
         .repositories()
         .map(|r| {
             let v = r.unwrap();
@@ -328,10 +341,12 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
                 v.canonical_path().unwrap().to_owned(),
                 v.ssh_url().unwrap().to_owned(),
                 v.clone_command().unwrap().to_owned(),
+                v.https_url().unwrap().to_owned(),
+                v.https_clone_command().unwrap().to_owned(),
             )
         })
         .collect();
-    let alice_paths: Vec<&str> = alice_repos.iter().map(|(p, _, _)| p.as_str()).collect();
+    let alice_paths: Vec<&str> = alice_repos.iter().map(|(p, _, _, _, _)| p.as_str()).collect();
     assert_eq!(
         alice_paths,
         vec![
@@ -349,6 +364,18 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
     assert_eq!(
         alice_repos[0].2,
         "git clone ssh://alice@git.example.com/teams/core/private/roadmap.git"
+    );
+    // Private repo has empty https_url and https_clone_command
+    assert_eq!(alice_repos[0].3, "");
+    assert_eq!(alice_repos[0].4, "");
+    // Public repo has populated https_url and https_clone_command
+    assert_eq!(
+        alice_repos[1].3,
+        "https://git.example.com/teams/core/public/ro-git.git"
+    );
+    assert_eq!(
+        alice_repos[1].4,
+        "git clone https://git.example.com/teams/core/public/ro-git.git"
     );
 
     // 1c. Authenticated gRPC with X-Forwarded-User and Remote-User headers
@@ -399,12 +426,14 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
     assert_eq!(resp.content_type, "application/x-protobuf");
     let view = GetAuthStatusResponseView::from_bytes(&resp.body).unwrap();
     assert!(!view.authenticated().unwrap());
+    assert_eq!(view.https_host().unwrap(), "git.example.com");
 
     let resp = send_http1_request(addr, "GET", API_REPOSITORIES_PATH, &[]);
     assert_eq!(resp.status_code, 200);
     assert_eq!(resp.content_type, "application/x-protobuf");
     let view = ListRepositoriesResponseView::from_bytes(&resp.body).unwrap();
     assert_eq!(view.repositories().count(), 3);
+    assert_eq!(view.https_host().unwrap(), "git.example.com");
 
     // 2b. Authenticated HTTP with Authorization: Bearer <token> (both Protobuf and JSON)
     let resp = send_http1_request(
@@ -433,6 +462,7 @@ fn end_to_end_grpc_and_http_anonymous_bearer_and_proxy_auth() {
     assert!(json_str.contains("\"authenticated\":true"));
     assert!(json_str.contains("\"username\":\"alice\""));
     assert!(json_str.contains("\"ssh_host\":\"git.example.com\""));
+    assert!(json_str.contains("\"https_host\":\"git.example.com\""));
 
     // Filtered HTTP repositories query with Bearer token
     let filtered_resp = send_http1_request(
@@ -563,6 +593,7 @@ fn end_to_end_dev_user_fallback_over_grpc_and_http() {
         listen_addr: String::from("127.0.0.1:0"),
         root_dir: root_dir.path().to_string_lossy().into_owned(),
         ssh_host: String::from("git.example.com"),
+        https_host: String::from("git.example.com"),
         static_dir: static_dir.path().to_string_lossy().into_owned(),
         max_token_ttl_secs: 2_592_000,
         nobody_uid: 65_534,
@@ -671,6 +702,7 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
         listen_addr: String::from("127.0.0.1:0"),
         root_dir: root.to_string_lossy().into_owned(),
         ssh_host: String::from("git.example.com"),
+        https_host: String::from("git.example.com"),
         static_dir: static_dir.path().to_string_lossy().into_owned(),
         max_token_ttl_secs: 2_592_000,
         nobody_uid: 65_534,
@@ -726,6 +758,15 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
         .expect("GetRepository on ro-git");
     assert_eq!(repo_view.head_ref().unwrap(), "main");
     assert_eq!(repo_view.resolved_revision().unwrap(), "main");
+    let repo_meta = repo_view.repository().unwrap().unwrap();
+    assert_eq!(
+        repo_meta.https_url().unwrap(),
+        "https://git.example.com/teams/core/public/ro-git.git"
+    );
+    assert_eq!(
+        repo_meta.https_clone_command().unwrap(),
+        "git clone https://git.example.com/teams/core/public/ro-git.git"
+    );
     let head_oid = repo_view.head_oid().unwrap().to_owned();
     assert_eq!(head_oid.len(), 40);
     let branches: Vec<String> = repo_view
@@ -863,15 +904,13 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
     let priv_view = client
         .get_repository(priv_req_bytes)
         .expect("team member alice accesses core private repo");
+    let priv_repo = priv_view.repository().unwrap().unwrap();
     assert_eq!(
-        priv_view
-            .repository()
-            .unwrap()
-            .unwrap()
-            .clone_command()
-            .unwrap(),
+        priv_repo.clone_command().unwrap(),
         "git clone ssh://alice@git.example.com/teams/core/private/roadmap.git"
     );
+    assert_eq!(priv_repo.https_url().unwrap(), "");
+    assert_eq!(priv_repo.https_clone_command().unwrap(), "");
 
     drop(client);
 
@@ -895,6 +934,8 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
     let json_str = std::str::from_utf8(&json_resp.body).unwrap();
     assert!(json_str.contains("\"head_ref\":\"main\""));
     assert!(json_str.contains("\"branches\":["));
+    assert!(json_str.contains("\"https_url\":\"https://git.example.com/teams/core/public/ro-git.git\""));
+    assert!(json_str.contains("\"https_clone_command\":\"git clone https://git.example.com/teams/core/public/ro-git.git\""));
 
     // 2b. GetTree HTTP/1.1 Protobuf & JSON
     let tree_url = format!("{tree_api}?revision=main&path=src");
@@ -959,6 +1000,128 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
         send_http1_request(addr, "GET", &format!("{blob_api}?path=../etc/passwd"), &[]).status_code,
         400
     );
+
+    server.shutdown();
+}
+
+#[test]
+fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
+    let (root_dir, _alice_priv) = setup_fixture_root();
+    let static_dir = setup_static_dir();
+    let root = root_dir.path();
+
+    let work_dir = TempDir::new("smart-http-work");
+    populate_bare_repo_fixture(&root.join("teams/core/public/ro-git.git"), work_dir.path());
+    populate_bare_repo_fixture(
+        &root.join("teams/core/private/roadmap.git"),
+        work_dir.path(),
+    );
+
+    // Create a symlinked public repo to ensure symlinks are rejected
+    let _ = symlink(
+        root.join("teams/core/public/ro-git.git"),
+        root.join("teams/core/public/symlinked.git"),
+    );
+
+    let server = start_server(ServerConfig {
+        listen_addr: String::from("127.0.0.1:0"),
+        root_dir: root.to_string_lossy().into_owned(),
+        ssh_host: String::from("git.example.com"),
+        https_host: String::from("git.example.com"),
+        static_dir: static_dir.path().to_string_lossy().into_owned(),
+        max_token_ttl_secs: 2_592_000,
+        nobody_uid: 65_534,
+        dev_user: None,
+    })
+    .expect("start_server for Smart HTTP test");
+    let addr = server.local_addr();
+
+    // 1. Real `git clone` over HTTP using Git Protocol v2 (default) with `.git` suffix
+    let clone_dest = TempDir::new("smart-http-clone-v2");
+    let public_url = format!("http://{addr}/teams/core/public/ro-git.git");
+    let clone_v2_out = std::process::Command::new("git")
+        .args(["clone", &public_url])
+        .arg(clone_dest.path().join("ro-git"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git clone over Smart HTTP v2");
+    assert!(
+        clone_v2_out.status.success(),
+        "git clone v2 failed: {}",
+        String::from_utf8_lossy(&clone_v2_out.stderr)
+    );
+    let cloned_readme =
+        fs::read_to_string(clone_dest.path().join("ro-git/README.md")).expect("read cloned README");
+    assert_eq!(cloned_readme, "# ro-git\nInitial docs.\nSecond line.\n");
+    let cloned_main = fs::read_to_string(clone_dest.path().join("ro-git/src/main.rs"))
+        .expect("read cloned src/main.rs");
+    assert_eq!(cloned_main, "fn main() {\n    println!(\"v1\");\n}\n");
+
+    // 2. Real `git clone` over HTTP using Git Protocol v0 without `.git` suffix
+    let clone_v0_dest = TempDir::new("smart-http-clone-v0");
+    let public_url_no_git = format!("http://{addr}/teams/core/public/ro-git");
+    let clone_v0_out = std::process::Command::new("git")
+        .args(["-c", "protocol.version=0", "clone", &public_url_no_git])
+        .arg(clone_v0_dest.path().join("ro-git"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git clone over Smart HTTP v0");
+    assert!(
+        clone_v0_out.status.success(),
+        "git clone v0 failed: {}",
+        String::from_utf8_lossy(&clone_v0_out.stderr)
+    );
+    let v0_readme = fs::read_to_string(clone_v0_dest.path().join("ro-git/README.md"))
+        .expect("read v0 cloned README");
+    assert_eq!(v0_readme, "# ro-git\nInitial docs.\nSecond line.\n");
+
+    // 3. Attempting to clone a private repository over HTTP is rejected with 403 Forbidden
+    let priv_info_refs = send_http1_request(
+        addr,
+        "GET",
+        "/teams/core/private/roadmap.git/info/refs?service=git-upload-pack",
+        &[],
+    );
+    assert_eq!(priv_info_refs.status_code, 403);
+
+    let priv_clone_dest = TempDir::new("smart-http-priv-clone");
+    let priv_url = format!("http://{addr}/teams/core/private/roadmap.git");
+    let priv_clone_out = std::process::Command::new("git")
+        .args(["clone", &priv_url])
+        .arg(priv_clone_dest.path().join("roadmap"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("attempt git clone private repo over HTTP");
+    assert!(
+        !priv_clone_out.status.success(),
+        "cloning private repository over HTTP must fail"
+    );
+
+    // 4. Attempting `git-receive-pack` (push) over HTTP is rejected with 403 Forbidden
+    let recv_info_refs = send_http1_request(
+        addr,
+        "GET",
+        "/teams/core/public/ro-git.git/info/refs?service=git-receive-pack",
+        &[],
+    );
+    assert_eq!(recv_info_refs.status_code, 403);
+
+    let recv_post = send_http1_request(
+        addr,
+        "POST",
+        "/teams/core/public/ro-git.git/git-receive-pack",
+        &[],
+    );
+    assert_eq!(recv_post.status_code, 403);
+
+    // 5. Symlinked public repository is rejected with 404
+    let sym_info_refs = send_http1_request(
+        addr,
+        "GET",
+        "/teams/core/public/symlinked.git/info/refs?service=git-upload-pack",
+        &[],
+    );
+    assert_eq!(sym_info_refs.status_code, 404);
 
     server.shutdown();
 }

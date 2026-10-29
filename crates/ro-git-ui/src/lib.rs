@@ -15,7 +15,8 @@ pub use repo_browser::*;
 use ro_git_proto::ro_git::v1::{GetAuthStatusResponseView, ListRepositoriesResponseView};
 use ro_git_proto::{
     encode_bearer_token, format_authenticated_ssh_url, format_canonical_path, format_clone_command,
-    format_ssh_keygen_sign_command, format_token_payload, is_valid_identifier, normalize_ssh_host,
+    format_https_clone_command, format_https_url, format_ssh_keygen_sign_command,
+    format_token_payload, is_valid_identifier, normalize_https_host, normalize_ssh_host,
     strip_git_suffix, validate_token_claims, TokenError, SCOPE_TEAMS, SCOPE_USERS,
     VISIBILITY_PRIVATE, VISIBILITY_PUBLIC,
 };
@@ -25,6 +26,17 @@ pub const LOCAL_STORAGE_TOKEN_KEY: &str = "ro_git_bearer_token";
 
 /// Fallback SSH hostname when the backend omits `ssh_host`.
 pub const DEFAULT_SSH_HOST: &str = "localhost";
+
+/// Fallback HTTPS hostname when the backend omits `https_host`.
+pub const DEFAULT_HTTPS_HOST: &str = "localhost";
+
+/// Selected Git clone protocol (`SSH` or `HTTPS`) for public repositories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloneProtocol {
+    #[default]
+    Ssh,
+    Https,
+}
 
 /// Maximum allowed token TTL in seconds (30 days).
 pub const MAX_TOKEN_TTL_SECS: u64 = 2_592_000;
@@ -65,6 +77,7 @@ pub struct AuthStatus {
     pub authenticated: bool,
     pub username: Option<String>,
     pub ssh_host: String,
+    pub https_host: String,
 }
 
 impl Default for AuthStatus {
@@ -77,10 +90,13 @@ impl AuthStatus {
     /// Constructs an unauthenticated status for the given `ssh_host`.
     #[must_use]
     pub fn anonymous(ssh_host: &str) -> Self {
+        let normalized_ssh = normalize_ssh_host(ssh_host).to_owned();
+        let https_host = normalize_https_host(&normalized_ssh).to_owned();
         Self {
             authenticated: false,
             username: None,
-            ssh_host: normalize_ssh_host(ssh_host).to_owned(),
+            ssh_host: normalized_ssh,
+            https_host,
         }
     }
 
@@ -92,12 +108,21 @@ impl AuthStatus {
         if trimmed.is_empty() {
             Self::anonymous(&host)
         } else {
+            let https_host = normalize_https_host(&host).to_owned();
             Self {
                 authenticated: true,
                 username: Some(trimmed.to_owned()),
                 ssh_host: host,
+                https_host,
             }
         }
+    }
+
+    /// Overrides the normalized HTTPS host/base URL on this [`AuthStatus`].
+    #[must_use]
+    pub fn with_https_host(mut self, https_host: &str) -> Self {
+        self.https_host = normalize_https_host(https_host).to_owned();
+        self
     }
 
     /// Formats the human-readable header status label.
@@ -120,10 +145,12 @@ pub struct RepositoryItem {
     pub canonical_path: String,
     pub ssh_url: String,
     pub clone_command: String,
+    pub https_url: String,
+    pub https_clone_command: String,
 }
 
 impl RepositoryItem {
-    /// Creates a `RepositoryItem` with formatted canonical path, SSH URL, and `git clone` command.
+    /// Creates a `RepositoryItem` with formatted canonical path, SSH/HTTPS URLs, and `git clone` commands.
     #[must_use]
     pub fn new(
         ssh_host: &str,
@@ -159,6 +186,21 @@ impl RepositoryItem {
             &clean_visibility,
             &clean_name,
         );
+        let https_host = normalize_https_host(ssh_host);
+        let https_url = format_https_url(
+            https_host,
+            &clean_scope,
+            &clean_owner,
+            &clean_visibility,
+            &clean_name,
+        );
+        let https_clone_command = format_https_clone_command(
+            https_host,
+            &clean_scope,
+            &clean_owner,
+            &clean_visibility,
+            &clean_name,
+        );
         Self {
             scope: clean_scope,
             owner: clean_owner,
@@ -167,7 +209,15 @@ impl RepositoryItem {
             canonical_path,
             ssh_url,
             clone_command,
+            https_url,
+            https_clone_command,
         }
+    }
+
+    /// Returns `true` if this repository has `"public"` visibility.
+    #[must_use]
+    pub fn is_public(&self) -> bool {
+        self.visibility == VISIBILITY_PUBLIC
     }
 
     /// Returns the singular badge label (`"user"` or `"team"`) for this repository's scope.
@@ -232,6 +282,30 @@ impl RepositoryItem {
             &self.name,
         )
     }
+
+    /// Computes the `https://` clone URL for the given `https_host` (or empty string if private).
+    #[must_use]
+    pub fn https_url_for(&self, https_host: &str) -> String {
+        format_https_url(
+            https_host,
+            &self.scope,
+            &self.owner,
+            &self.visibility,
+            &self.name,
+        )
+    }
+
+    /// Computes the `git clone https://...` command for the given `https_host` (or empty string if private).
+    #[must_use]
+    pub fn https_clone_command_for(&self, https_host: &str) -> String {
+        format_https_clone_command(
+            https_host,
+            &self.scope,
+            &self.owner,
+            &self.visibility,
+            &self.name,
+        )
+    }
 }
 
 /// Decoded snapshot from `GET /api/v1/repositories`.
@@ -240,6 +314,7 @@ pub struct RepositoriesSnapshot {
     pub repositories: Vec<RepositoryItem>,
     pub authenticated_user: Option<String>,
     pub ssh_host: String,
+    pub https_host: String,
 }
 
 /// Decodes raw Protobuf bytes from `GET /api/v1/auth/status` into an [`AuthStatus`].
@@ -256,11 +331,20 @@ pub fn decode_auth_status_response(bytes: &[u8]) -> Result<AuthStatus, String> {
     let ssh_host = view
         .ssh_host()
         .map_err(|e| format!("invalid ssh_host field: {e:?}"))?;
+    let raw_https_host = view
+        .https_host()
+        .map_err(|e| format!("invalid https_host field: {e:?}"))?
+        .trim();
 
-    if authenticated && !username.is_empty() {
-        Ok(AuthStatus::authenticated(username, ssh_host))
+    let status = if authenticated && !username.is_empty() {
+        AuthStatus::authenticated(username, ssh_host)
     } else {
-        Ok(AuthStatus::anonymous(ssh_host))
+        AuthStatus::anonymous(ssh_host)
+    };
+    if raw_https_host.is_empty() {
+        Ok(status)
+    } else {
+        Ok(status.with_https_host(raw_https_host))
     }
 }
 
@@ -277,6 +361,15 @@ pub fn decode_repositories_response(bytes: &[u8]) -> Result<RepositoriesSnapshot
         .ssh_host()
         .map_err(|e| format!("invalid ssh_host field: {e:?}"))?;
     let ssh_host = normalize_ssh_host(raw_host).to_owned();
+    let raw_https_host = view
+        .https_host()
+        .map_err(|e| format!("invalid https_host field: {e:?}"))?
+        .trim();
+    let https_host = if raw_https_host.is_empty() {
+        normalize_https_host(&ssh_host).to_owned()
+    } else {
+        normalize_https_host(raw_https_host).to_owned()
+    };
 
     let mut repositories = Vec::new();
     for entry in view.repositories() {
@@ -297,6 +390,14 @@ pub fn decode_repositories_response(bytes: &[u8]) -> Result<RepositoriesSnapshot
             .canonical_path()
             .map_err(|e| format!("invalid canonical_path field: {e:?}"))?
             .trim();
+        let raw_https_url = repo_view
+            .https_url()
+            .map_err(|e| format!("invalid https_url field: {e:?}"))?
+            .trim();
+        let raw_https_clone = repo_view
+            .https_clone_command()
+            .map_err(|e| format!("invalid https_clone_command field: {e:?}"))?
+            .trim();
 
         let mut item = RepositoryItem::new(
             &ssh_host,
@@ -309,6 +410,16 @@ pub fn decode_repositories_response(bytes: &[u8]) -> Result<RepositoriesSnapshot
         if !raw_canonical.is_empty() {
             item.canonical_path = raw_canonical.to_owned();
         }
+        item.https_url = if !raw_https_url.is_empty() {
+            raw_https_url.to_owned()
+        } else {
+            item.https_url_for(&https_host)
+        };
+        item.https_clone_command = if !raw_https_clone.is_empty() {
+            raw_https_clone.to_owned()
+        } else {
+            item.https_clone_command_for(&https_host)
+        };
         repositories.push(item);
     }
 
@@ -318,6 +429,7 @@ pub fn decode_repositories_response(bytes: &[u8]) -> Result<RepositoriesSnapshot
         repositories,
         authenticated_user,
         ssh_host,
+        https_host,
     })
 }
 
@@ -703,6 +815,8 @@ pub fn format_authorization_header(token: &str) -> Option<String> {
 pub enum CopyTarget {
     CloneCommand(String),
     SshUrl(String),
+    HttpsCloneCommand(String),
+    HttpsUrl(String),
     SignCommand,
 }
 
@@ -724,7 +838,7 @@ pub fn copy_button_label<'a>(
 mod tests {
     use super::*;
     use ro_git_proto::ro_git::v1::{GetAuthStatusResponseBuilder, ListRepositoriesResponseBuilder};
-    use ro_git_proto:: decode_bearer_token;
+    use ro_git_proto::decode_bearer_token;
 
     const SAMPLE_SSHSIG_PEM: &str = "-----BEGIN SSH SIGNATURE-----\n\
 U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg8f7/7f39/f39/f39/f39\n\
@@ -749,12 +863,15 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         assert!(!anon.authenticated);
         assert_eq!(anon.username, None);
         assert_eq!(anon.ssh_host, "localhost");
+        assert_eq!(anon.https_host, "localhost");
         assert_eq!(anon.header_label(), "Anonymous (public repos only)");
 
-        let auth = AuthStatus::authenticated("alice", "ssh://git.example.com:2222/");
+        let auth = AuthStatus::authenticated("alice", "ssh://git.example.com:2222/")
+            .with_https_host("https://git.example.com/");
         assert!(auth.authenticated);
         assert_eq!(auth.username.as_deref(), Some("alice"));
         assert_eq!(auth.ssh_host, "git.example.com:2222");
+        assert_eq!(auth.https_host, "git.example.com");
         assert_eq!(auth.header_label(), "Signed in as alice");
 
         let blank_user = AuthStatus::authenticated("   ", "git.example.com");
@@ -768,6 +885,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         let mut buf = [0u8; 256];
         let mut builder = GetAuthStatusResponseBuilder::new(&mut buf);
         builder
+            .write_https_host("https://git.internal/")
             .write_ssh_host("git.internal:2222")
             .write_username("charles")
             .write_authenticated(true);
@@ -777,6 +895,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         assert!(decoded.authenticated);
         assert_eq!(decoded.username.as_deref(), Some("charles"));
         assert_eq!(decoded.ssh_host, "git.internal:2222");
+        assert_eq!(decoded.https_host, "git.internal");
         assert_eq!(decoded.header_label(), "Signed in as charles");
 
         // Unauthenticated response
@@ -791,6 +910,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         assert!(!anon_decoded.authenticated);
         assert_eq!(anon_decoded.username, None);
         assert_eq!(anon_decoded.ssh_host, "git.internal");
+        assert_eq!(anon_decoded.https_host, "git.internal");
 
         // Truncated wire bytes fail cleanly
         assert!(decode_auth_status_response(&[0x0a, 0xff]).is_err());
@@ -806,13 +926,19 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         let mut buf = [0u8; 1024];
         let mut builder = ListRepositoriesResponseBuilder::new(&mut buf);
         builder
+            .write_https_host("https://git.example.org/")
             .write_ssh_host("ssh://git.example.org/")
             .write_authenticated_user("alice");
 
         for &(scope, owner, vis, name) in fixtures.iter().rev() {
             let canonical = format_canonical_path(scope, owner, vis, name);
+            let https_url = format_https_url("https://git.example.org", scope, owner, vis, name);
+            let https_clone =
+                format_https_clone_command("https://git.example.org", scope, owner, vis, name);
             builder.write_repositories(|repo| {
-                repo.write_canonical_path(&canonical)
+                repo.write_https_clone_command(&https_clone)
+                    .write_https_url(&https_url)
+                    .write_canonical_path(&canonical)
                     .write_name(name)
                     .write_visibility(vis)
                     .write_owner(owner)
@@ -824,6 +950,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         let bytes = builder.finish().expect("encode ListRepositoriesResponse");
         let snapshot = decode_repositories_response(bytes).expect("decode repositories");
         assert_eq!(snapshot.ssh_host, "git.example.org");
+        assert_eq!(snapshot.https_host, "git.example.org");
         assert_eq!(snapshot.authenticated_user.as_deref(), Some("alice"));
         assert_eq!(snapshot.repositories.len(), 2);
 
@@ -832,6 +959,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
         assert_eq!(first.scope, "users");
         assert_eq!(first.owner, "alice");
         assert_eq!(first.visibility, "public");
+        assert!(first.is_public());
         assert_eq!(first.name, "dotfiles");
         assert_eq!(first.canonical_path, "/users/alice/public/dotfiles.git");
         assert_eq!(
@@ -842,11 +970,20 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             first.clone_command,
             "git clone ssh://alice@git.example.org/users/alice/public/dotfiles.git"
         );
+        assert_eq!(
+            first.https_url,
+            "https://git.example.org/users/alice/public/dotfiles.git"
+        );
+        assert_eq!(
+            first.https_clone_command,
+            "git clone https://git.example.org/users/alice/public/dotfiles.git"
+        );
 
         let second = &snapshot.repositories[1];
         assert_eq!(second.scope, "teams");
         assert_eq!(second.owner, "core");
         assert_eq!(second.visibility, "private");
+        assert!(!second.is_public());
         assert_eq!(second.name, "ro-git");
         assert_eq!(second.canonical_path, "/teams/core/private/ro-git.git");
         assert_eq!(
@@ -857,6 +994,8 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             second.clone_command,
             "git clone ssh://alice@git.example.org/teams/core/private/ro-git.git"
         );
+        assert_eq!(second.https_url, "");
+        assert_eq!(second.https_clone_command, "");
 
         // Invalid wire bytes fail cleanly
         assert!(decode_repositories_response(&[0x0a, 0x99]).is_err());
@@ -873,6 +1012,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             "notes.git",
         );
         assert_eq!(anon_repo.name, "notes");
+        assert!(anon_repo.is_public());
         assert_eq!(anon_repo.scope_badge(), "user");
         assert_eq!(anon_repo.visibility_badge(), "public");
         assert_eq!(anon_repo.group_path(), "/users/alice");
@@ -889,12 +1029,28 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             "git clone ssh://git.example.com/users/alice/public/notes.git"
         );
         assert_eq!(
+            anon_repo.https_url,
+            "https://git.example.com/users/alice/public/notes.git"
+        );
+        assert_eq!(
+            anon_repo.https_clone_command,
+            "git clone https://git.example.com/users/alice/public/notes.git"
+        );
+        assert_eq!(
             anon_repo.ssh_url_for("git.example.com", Some("alice")),
             "ssh://alice@git.example.com/users/alice/public/notes.git"
         );
         assert_eq!(
             anon_repo.clone_command_for("git.example.com", Some("alice")),
             "git clone ssh://alice@git.example.com/users/alice/public/notes.git"
+        );
+        assert_eq!(
+            anon_repo.https_url_for("https://git.example.com:8443/"),
+            "https://git.example.com:8443/users/alice/public/notes.git"
+        );
+        assert_eq!(
+            anon_repo.https_clone_command_for("https://git.example.com:8443/"),
+            "git clone https://git.example.com:8443/users/alice/public/notes.git"
         );
 
         let team_repo = RepositoryItem::new(
@@ -905,6 +1061,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             "private",
             "deploy",
         );
+        assert!(!team_repo.is_public());
         assert_eq!(team_repo.scope_badge(), "team");
         assert_eq!(team_repo.visibility_badge(), "private");
         assert_eq!(team_repo.group_path(), "/teams/platform");
@@ -916,6 +1073,10 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n\
             team_repo.clone_command,
             "git clone ssh://bob@git.example.com:2222/teams/platform/private/deploy.git"
         );
+        assert_eq!(team_repo.https_url, "");
+        assert_eq!(team_repo.https_clone_command, "");
+        assert_eq!(team_repo.https_url_for("git.example.com"), "");
+        assert_eq!(team_repo.https_clone_command_for("git.example.com"), "");
     }
 
     #[test]

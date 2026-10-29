@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,10 +32,11 @@ use ro_git_proto::ro_git::v1::{
     WorkerResponseBuilder, WorkerResponseView,
 };
 use ro_git_proto::{
-    decode_bearer_token, format_canonical_path, format_clone_command, format_ssh_url,
-    is_valid_identifier, is_valid_scope, is_valid_visibility, normalize_ssh_host,
-    validate_token_claims, TokenError, API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH, SCOPE_TEAMS,
-    SCOPE_USERS, SSH_SIG_NAMESPACE, VISIBILITY_PRIVATE, VISIBILITY_PUBLIC,
+    decode_bearer_token, format_canonical_path, format_clone_command, format_https_clone_command,
+    format_https_url, format_ssh_url, is_valid_identifier, is_valid_scope, is_valid_visibility,
+    normalize_https_host, normalize_ssh_host, strip_git_suffix, validate_token_claims, TokenError,
+    API_AUTH_STATUS_PATH, API_REPOSITORIES_PATH, SCOPE_TEAMS, SCOPE_USERS, SSH_SIG_NAMESPACE,
+    VISIBILITY_PRIVATE, VISIBILITY_PUBLIC,
 };
 use roto::runtime::BackwardWriter;
 use roto_grpc::http::{
@@ -49,12 +51,13 @@ use ssh_key::{PublicKey, SshSig};
 pub mod git_reader;
 pub use git_reader::*;
 
-/// Server configuration resolved from environment variables.
+/// Server configuration resolved from environment variables and CLI flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
     pub listen_addr: String,
     pub root_dir: String,
     pub ssh_host: String,
+    pub https_host: String,
     pub static_dir: String,
     pub max_token_ttl_secs: u64,
     pub nobody_uid: u32,
@@ -67,6 +70,7 @@ impl Default for ServerConfig {
             listen_addr: String::from("0.0.0.0:8080"),
             root_dir: String::from("/"),
             ssh_host: String::from("localhost"),
+            https_host: String::from("localhost"),
             static_dir: String::from("/app/dist"),
             max_token_ttl_secs: 2_592_000,
             nobody_uid: 65_534,
@@ -105,6 +109,11 @@ impl ServerConfig {
         if let Some(val) = non_empty("RO_GIT_SSH_HOST") {
             cfg.ssh_host = val;
         }
+        if let Some(val) =
+            non_empty("RO_GIT_HTTPS_HOST").or_else(|| non_empty("RO_GIT_PUBLIC_URL"))
+        {
+            cfg.https_host = normalize_https_host(&val).to_owned();
+        }
         if let Some(val) = non_empty("RO_GIT_STATIC_DIR") {
             cfg.static_dir = val;
         }
@@ -116,6 +125,49 @@ impl ServerConfig {
         }
         cfg.dev_user = non_empty("RO_GIT_DEV_USER");
         cfg
+    }
+
+    /// Applies optional CLI overrides (`--ssh-host <HOST>`, `--https-host <URL>`, and
+    /// `--public-url <URL>`, in both `<FLAG> <VAL>` and `<FLAG>=<VAL>` forms) to this configuration.
+    #[must_use]
+    pub fn with_cli_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            let s = arg.as_ref();
+            if s == "--ssh-host" {
+                if let Some(val) = iter.next() {
+                    let trimmed = val.as_ref().trim();
+                    if !trimmed.is_empty() {
+                        self.ssh_host = normalize_ssh_host(trimmed).to_owned();
+                    }
+                }
+            } else if let Some(val) = s.strip_prefix("--ssh-host=") {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    self.ssh_host = normalize_ssh_host(trimmed).to_owned();
+                }
+            } else if matches!(s, "--https-host" | "--public-url") {
+                if let Some(val) = iter.next() {
+                    let trimmed = val.as_ref().trim();
+                    if !trimmed.is_empty() {
+                        self.https_host = normalize_https_host(trimmed).to_owned();
+                    }
+                }
+            } else if let Some(val) = s
+                .strip_prefix("--https-host=")
+                .or_else(|| s.strip_prefix("--public-url="))
+            {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    self.https_host = normalize_https_host(trimmed).to_owned();
+                }
+            }
+        }
+        self
     }
 }
 
@@ -181,11 +233,15 @@ pub struct DiscoveredRepository {
     pub canonical_path: String,
     pub ssh_url: String,
     pub clone_command: String,
+    pub https_url: String,
+    pub https_clone_command: String,
 }
 
 impl DiscoveredRepository {
     pub(crate) fn encode_into(&self, r: &mut RepositoryInfoBuilder<'_>) {
-        r.write_clone_command(&self.clone_command)
+        r.write_https_clone_command(&self.https_clone_command)
+            .write_https_url(&self.https_url)
+            .write_clone_command(&self.clone_command)
             .write_ssh_url(&self.ssh_url)
             .write_canonical_path(&self.canonical_path)
             .write_name(&self.name)
@@ -670,6 +726,7 @@ fn matches_repository_query(
 
 struct DiscoveryContext<'a> {
     normalized_host: &'a str,
+    normalized_https_host: &'a str,
     auth_user: Option<&'a str>,
     filter_query: &'a str,
 }
@@ -723,6 +780,20 @@ fn scan_visibility_dir(
             visibility,
             repo_name,
         );
+        let https_url = format_https_url(
+            ctx.normalized_https_host,
+            scope,
+            owner,
+            visibility,
+            repo_name,
+        );
+        let https_clone_command = format_https_clone_command(
+            ctx.normalized_https_host,
+            scope,
+            owner,
+            visibility,
+            repo_name,
+        );
 
         discovered.push(DiscoveredRepository {
             scope: scope.to_owned(),
@@ -732,6 +803,8 @@ fn scan_visibility_dir(
             canonical_path,
             ssh_url,
             clone_command,
+            https_url,
+            https_clone_command,
         });
     }
 }
@@ -743,6 +816,7 @@ fn scan_visibility_dir(
 pub fn discover_repositories(
     root_dir: &Path,
     ssh_host: &str,
+    https_host: &str,
     creds: &UserCredentials,
     filter: &RepositoryFilter<'_>,
 ) -> Vec<DiscoveredRepository> {
@@ -763,6 +837,7 @@ pub fn discover_repositories(
 
     let ctx = DiscoveryContext {
         normalized_host: normalize_ssh_host(ssh_host),
+        normalized_https_host: normalize_https_host(https_host),
         auth_user: creds.username.as_deref(),
         filter_query: &filter_query,
     };
@@ -879,6 +954,7 @@ fn execute_worker_request(req_bytes: &[u8], drop_privileges: bool) -> Vec<u8> {
         root_dir_str
     });
     let ssh_host = normalize_ssh_host(req_view.ssh_host().unwrap_or("localhost"));
+    let https_host = normalize_https_host(req_view.https_host().unwrap_or("localhost"));
     let max_ttl = req_view.max_token_ttl_secs().unwrap_or(2_592_000);
     let now_secs = match req_view.now_unix_secs().unwrap_or(0) {
         0 => current_unix_secs(),
@@ -919,7 +995,7 @@ fn execute_worker_request(req_bytes: &[u8], drop_privileges: bool) -> Vec<u8> {
         Ok(Some(worker_request::Command::GetAuthStatus(_))) => {
             encode_worker_ok(2048, |builder| {
                 builder.write_auth_status(|auth| {
-                    auth.write_ssh_host(ssh_host);
+                    auth.write_https_host(https_host).write_ssh_host(ssh_host);
                     if let Some(ref user) = creds.username {
                         auth.write_username(user).write_authenticated(true);
                     } else {
@@ -936,11 +1012,12 @@ fn execute_worker_request(req_bytes: &[u8], drop_privileges: bool) -> Vec<u8> {
                 visibility: lr.visibility().unwrap_or(""),
                 query: lr.query().unwrap_or(""),
             };
-            let repos = discover_repositories(root_dir, ssh_host, &creds, &filter);
+            let repos = discover_repositories(root_dir, ssh_host, https_host, &creds, &filter);
             encode_worker_ok(65_536, |builder| {
                 let mut ok = true;
                 builder.write_list_repositories(|list_resp| {
                     list_resp
+                        .write_https_host(https_host)
                         .write_ssh_host(ssh_host)
                         .write_authenticated_user(creds.username.as_deref().unwrap_or(""));
                     for repo in repos.iter().rev() {
@@ -958,6 +1035,7 @@ fn execute_worker_request(req_bytes: &[u8], drop_privileges: bool) -> Vec<u8> {
             let inspection = match inspect_repository(
                 root_dir,
                 ssh_host,
+                https_host,
                 &creds,
                 gr.scope().unwrap_or(""),
                 gr.owner().unwrap_or(""),
@@ -1309,6 +1387,7 @@ impl GitServiceHandler {
         let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
         write_command(&mut req_builder);
         req_builder
+            .write_https_host(&self.config.https_host)
             .write_now_unix_secs(now_secs)
             .write_max_token_ttl_secs(self.config.max_token_ttl_secs)
             .write_ssh_host(&self.config.ssh_host)
@@ -1351,7 +1430,8 @@ impl GitService for GitServiceHandler {
 
         match resp_view.result() {
             Ok(Some(worker_response::Result::AuthStatus(auth))) => {
-                resp.write_ssh_host(auth.ssh_host().unwrap_or(&self.config.ssh_host))
+                resp.write_https_host(auth.https_host().unwrap_or(&self.config.https_host))
+                    .write_ssh_host(auth.ssh_host().unwrap_or(&self.config.ssh_host))
                     .write_username(auth.username().unwrap_or(""))
                     .write_authenticated(auth.authenticated().unwrap_or(false));
                 Ok(())
@@ -1384,7 +1464,8 @@ impl GitService for GitServiceHandler {
 
         match resp_view.result() {
             Ok(Some(worker_response::Result::ListRepositories(list_view))) => {
-                resp.write_ssh_host(list_view.ssh_host().unwrap_or(&self.config.ssh_host))
+                resp.write_https_host(list_view.https_host().unwrap_or(&self.config.https_host))
+                    .write_ssh_host(list_view.ssh_host().unwrap_or(&self.config.ssh_host))
                     .write_authenticated_user(list_view.authenticated_user().unwrap_or(""));
 
                 let mut decoded_repos = Vec::new();
@@ -1400,12 +1481,18 @@ impl GitService for GitServiceHandler {
                         v.canonical_path().unwrap_or(""),
                         v.ssh_url().unwrap_or(""),
                         v.clone_command().unwrap_or(""),
+                        v.https_url().unwrap_or(""),
+                        v.https_clone_command().unwrap_or(""),
                     ));
                 }
 
-                for &(s, o, vis, name, cpath, surl, ccmd) in decoded_repos.iter().rev() {
+                for &(s, o, vis, name, cpath, surl, ccmd, hurl, hccmd) in
+                    decoded_repos.iter().rev()
+                {
                     resp.write_repositories(|r| {
-                        r.write_clone_command(ccmd)
+                        r.write_https_clone_command(hccmd)
+                            .write_https_url(hurl)
+                            .write_clone_command(ccmd)
                             .write_ssh_url(surl)
                             .write_canonical_path(cpath)
                             .write_name(name)
@@ -1752,6 +1839,8 @@ pub fn serve_static_asset(static_dir: &Path, request_path: &str) -> StaticAssetR
 #[derive(Clone, Debug)]
 pub struct StaticAssetService {
     pub static_dir: PathBuf,
+    pub root_dir: PathBuf,
+    pub nobody_uid: u32,
 }
 
 impl StaticAssetService {
@@ -1759,6 +1848,17 @@ impl StaticAssetService {
     pub fn new(static_dir: impl Into<PathBuf>) -> Self {
         Self {
             static_dir: static_dir.into(),
+            root_dir: PathBuf::from("/"),
+            nobody_uid: 65_534,
+        }
+    }
+
+    #[must_use]
+    pub fn with_config(config: &ServerConfig) -> Self {
+        Self {
+            static_dir: PathBuf::from(&config.static_dir),
+            root_dir: PathBuf::from(&config.root_dir),
+            nobody_uid: config.nobody_uid,
         }
     }
 }
@@ -1795,6 +1895,43 @@ impl HttpService for StaticAssetService {
     ) -> Option<Result<HttpResponse<'b>, GrpcStatus<'static>>> {
         if req.path == "/api" || req.path.starts_with("/api/") {
             return None;
+        }
+        if let Some(git_route) = match_git_smart_http_route(req.path) {
+            let method_str = match req.method {
+                HttpMethod::Get => "GET",
+                HttpMethod::Post => "POST",
+                _ => "OTHER",
+            };
+            let git_resp = handle_git_smart_http(
+                &self.root_dir,
+                self.nobody_uid,
+                method_str,
+                req.query,
+                None,
+                req.body,
+                git_route,
+                false,
+            );
+            return match git_resp.status_code {
+                200 => {
+                    if writer.write_bytes(&git_resp.body).is_err() || writer.check().is_err() {
+                        return Some(Err(GrpcStatus::resource_exhausted(
+                            "git smart http response buffer exhausted",
+                        )));
+                    }
+                    let mut resp = match finish_writer_response(writer, None) {
+                        Ok(r) => r,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    resp.content_type = git_resp.content_type;
+                    Some(Ok(resp))
+                }
+                400 => Some(Err(GrpcStatus::invalid_argument("bad request"))),
+                403 => Some(Err(GrpcStatus::permission_denied("forbidden"))),
+                404 => Some(Err(GrpcStatus::not_found("not found"))),
+                405 => Some(Err(GrpcStatus::invalid_argument("method not allowed"))),
+                _ => Some(Err(GrpcStatus::internal("git upload-pack error"))),
+            };
         }
         if req.method != HttpMethod::Get {
             return Some(Err(GrpcStatus::invalid_argument("method not allowed")));
@@ -1860,14 +1997,17 @@ fn encode_auth_status_json(view: GetAuthStatusResponseView<'_>) -> Vec<u8> {
     let authenticated = view.authenticated().unwrap_or(false);
     let username = view.username().unwrap_or("");
     let ssh_host = view.ssh_host().unwrap_or("");
+    let https_host = view.https_host().unwrap_or("");
 
-    let mut json = String::with_capacity(128);
+    let mut json = String::with_capacity(160);
     json.push_str("{\"authenticated\":");
     json.push_str(if authenticated { "true" } else { "false" });
     json.push_str(",\"username\":");
     push_json_escaped(&mut json, username);
     json.push_str(",\"ssh_host\":");
     push_json_escaped(&mut json, ssh_host);
+    json.push_str(",\"https_host\":");
+    push_json_escaped(&mut json, https_host);
     json.push('}');
     json.into_bytes()
 }
@@ -1875,6 +2015,7 @@ fn encode_auth_status_json(view: GetAuthStatusResponseView<'_>) -> Vec<u8> {
 fn encode_list_repositories_json(view: ListRepositoriesResponseView<'_>) -> Vec<u8> {
     let auth_user = view.authenticated_user().unwrap_or("");
     let ssh_host = view.ssh_host().unwrap_or("");
+    let https_host = view.https_host().unwrap_or("");
 
     let mut json = String::with_capacity(512);
     json.push_str("{\"repositories\":[");
@@ -1890,6 +2031,8 @@ fn encode_list_repositories_json(view: ListRepositoriesResponseView<'_>) -> Vec<
     push_json_escaped(&mut json, auth_user);
     json.push_str(",\"ssh_host\":");
     push_json_escaped(&mut json, ssh_host);
+    json.push_str(",\"https_host\":");
+    push_json_escaped(&mut json, https_host);
     json.push('}');
     json.into_bytes()
 }
@@ -1903,6 +2046,7 @@ struct ParsedH1Request {
     x_forwarded_user: Option<String>,
     remote_user: Option<String>,
     accept: Option<String>,
+    git_protocol: Option<String>,
     connection_close: bool,
 }
 
@@ -1971,6 +2115,8 @@ fn parse_h1_headers(header_bytes: &[u8]) -> Option<(ParsedH1Request, usize)> {
             parsed.remote_user = Some(val_trimmed.to_owned());
         } else if name_trimmed.eq_ignore_ascii_case("accept") {
             parsed.accept = Some(val_trimmed.to_owned());
+        } else if name_trimmed.eq_ignore_ascii_case("git-protocol") {
+            parsed.git_protocol = Some(val_trimmed.to_owned());
         } else if name_trimmed.eq_ignore_ascii_case("content-length") {
             content_length = val_trimmed.parse::<usize>().ok()?;
         } else if name_trimmed.eq_ignore_ascii_case("connection")
@@ -2121,6 +2267,313 @@ fn handle_h1_list_repositories(
         ListRepositoriesResponseView::from_bytes,
         encode_list_repositories_json,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitSmartHttpAction {
+    InfoRefs,
+    UploadPack,
+    ReceivePack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GitSmartHttpRoute<'a> {
+    scope: &'a str,
+    owner: &'a str,
+    visibility: &'a str,
+    name: &'a str,
+    action: GitSmartHttpAction,
+}
+
+fn match_git_smart_http_route(path: &str) -> Option<GitSmartHttpRoute<'_>> {
+    let trimmed = path.strip_prefix('/')?;
+    let mut parts = trimmed.split('/');
+    let scope = parts.next().filter(|s| *s == "users" || *s == "teams")?;
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let visibility = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("info"), Some("refs"), None) => Some(GitSmartHttpRoute {
+            scope,
+            owner,
+            visibility,
+            name,
+            action: GitSmartHttpAction::InfoRefs,
+        }),
+        (Some("git-upload-pack"), None, None) => Some(GitSmartHttpRoute {
+            scope,
+            owner,
+            visibility,
+            name,
+            action: GitSmartHttpAction::UploadPack,
+        }),
+        (Some("git-receive-pack"), None, None) => Some(GitSmartHttpRoute {
+            scope,
+            owner,
+            visibility,
+            name,
+            action: GitSmartHttpAction::ReceivePack,
+        }),
+        _ => None,
+    }
+}
+
+fn sanitize_git_protocol(header: Option<&str>) -> Option<&str> {
+    let val = header?.trim();
+    if val.is_empty() || val.len() > 256 {
+        return None;
+    }
+    if val
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b':' | b'.' | b'-' | b'_'))
+    {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn resolve_public_smart_http_repo(
+    root: &Path,
+    route: GitSmartHttpRoute<'_>,
+    omit_body: bool,
+) -> Result<PathBuf, H1Response> {
+    let mut scope_buf = [0u8; 128];
+    let mut owner_buf = [0u8; 128];
+    let mut vis_buf = [0u8; 128];
+    let mut name_buf = [0u8; 128];
+
+    let Ok(scope) = percent_decode_str(route.scope, &mut scope_buf) else {
+        return Err(H1Response::plain_error(
+            400,
+            "invalid path parameter encoding",
+            omit_body,
+        ));
+    };
+    let Ok(owner) = percent_decode_str(route.owner, &mut owner_buf) else {
+        return Err(H1Response::plain_error(
+            400,
+            "invalid path parameter encoding",
+            omit_body,
+        ));
+    };
+    let Ok(visibility) = percent_decode_str(route.visibility, &mut vis_buf) else {
+        return Err(H1Response::plain_error(
+            400,
+            "invalid path parameter encoding",
+            omit_body,
+        ));
+    };
+    let Ok(raw_name) = percent_decode_str(route.name, &mut name_buf) else {
+        return Err(H1Response::plain_error(
+            400,
+            "invalid path parameter encoding",
+            omit_body,
+        ));
+    };
+
+    if scope != "users" && scope != "teams" {
+        return Err(H1Response::plain_error(404, "not found", omit_body));
+    }
+    if visibility != "public" {
+        return Err(H1Response::plain_error(
+            403,
+            "HTTPS clone is only supported for public repositories",
+            omit_body,
+        ));
+    }
+
+    let name = strip_git_suffix(raw_name);
+    if !is_valid_identifier(owner) || !is_valid_identifier(name) {
+        return Err(H1Response::plain_error(
+            400,
+            "invalid repository identifier",
+            omit_body,
+        ));
+    }
+
+    let scope_dir = root.join(scope);
+    let owner_dir = scope_dir.join(owner);
+    let vis_dir = owner_dir.join("public");
+    let repo_dir = vis_dir.join(format!("{name}.git"));
+
+    for ancestor in [&scope_dir, &owner_dir, &vis_dir, &repo_dir] {
+        let Ok(meta) = fs::symlink_metadata(ancestor) else {
+            return Err(H1Response::plain_error(
+                404,
+                "repository not found",
+                omit_body,
+            ));
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(H1Response::plain_error(
+                404,
+                "repository not found",
+                omit_body,
+            ));
+        }
+    }
+
+    Ok(repo_dir)
+}
+
+fn spawn_git_upload_pack(
+    repo_dir: &Path,
+    advertise_refs: bool,
+    git_protocol: Option<&str>,
+    nobody_uid: u32,
+) -> io::Result<std::process::Child> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-optional-locks").arg("upload-pack");
+    if advertise_refs {
+        cmd.arg("--stateless-rpc").arg("--advertise-refs");
+    } else {
+        cmd.arg("--stateless-rpc");
+    }
+    cmd.arg("--strict")
+        .arg(repo_dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C")
+        .stdin(if advertise_refs {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(proto) = sanitize_git_protocol(git_protocol) {
+        cmd.env("GIT_PROTOCOL", proto);
+    } else {
+        cmd.env_remove("GIT_PROTOCOL");
+    }
+
+    if geteuid().is_root() && nobody_uid != 0 {
+        cmd.uid(nobody_uid).gid(nobody_uid);
+    }
+
+    cmd.spawn()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_git_smart_http(
+    root: &Path,
+    nobody_uid: u32,
+    method: &str,
+    query: &str,
+    git_protocol: Option<&str>,
+    req_body: &[u8],
+    route: GitSmartHttpRoute<'_>,
+    omit_body: bool,
+) -> H1Response {
+    if route.action == GitSmartHttpAction::ReceivePack {
+        return H1Response::plain_error(
+            403,
+            "git-receive-pack is disabled on read-only HTTP server",
+            omit_body,
+        );
+    }
+
+    let repo_dir = match resolve_public_smart_http_repo(root, route, omit_body) {
+        Ok(dir) => dir,
+        Err(resp) => return resp,
+    };
+
+    match route.action {
+        GitSmartHttpAction::InfoRefs => {
+            let is_get = method.eq_ignore_ascii_case("GET");
+            let is_head = method.eq_ignore_ascii_case("HEAD");
+            if !is_get && !is_head {
+                return H1Response::plain_error(405, "method not allowed", false);
+            }
+
+            let mut raw_service = "";
+            for (k, v) in QueryIter::new(query) {
+                if k == "service" {
+                    raw_service = v;
+                }
+            }
+            let mut svc_buf = [0u8; 128];
+            let service = percent_decode_str(raw_service, &mut svc_buf).unwrap_or("");
+            if service == "git-receive-pack" {
+                return H1Response::plain_error(
+                    403,
+                    "git-receive-pack is disabled on read-only HTTP server",
+                    omit_body,
+                );
+            }
+            if service != "git-upload-pack" {
+                return H1Response::plain_error(
+                    403,
+                    "only service=git-upload-pack is supported",
+                    omit_body,
+                );
+            }
+
+            let Ok(child) = spawn_git_upload_pack(&repo_dir, true, git_protocol, nobody_uid) else {
+                return H1Response::plain_error(500, "failed to spawn git upload-pack", omit_body);
+            };
+            let Ok(out) = child.wait_with_output() else {
+                return H1Response::plain_error(500, "git upload-pack failed", omit_body);
+            };
+            if !out.status.success() {
+                return H1Response::plain_error(404, "repository not found", omit_body);
+            }
+
+            // In Git Protocol v2 (`GIT_PROTOCOL=version=2`), `git upload-pack --advertise-refs`
+            // outputs `000eversion 2\n...` directly and must not be prefixed with `# service=`.
+            // In Git Protocol v0/v1, the HTTP server must prepend the `# service=git-upload-pack`
+            // pkt-line followed by a flush packet (`0000`).
+            let body = if out.stdout.starts_with(b"000eversion 2\n") {
+                out.stdout
+            } else {
+                const PKT_HEADER: &[u8] = b"001e# service=git-upload-pack\n0000";
+                let mut buf = Vec::with_capacity(PKT_HEADER.len() + out.stdout.len());
+                buf.extend_from_slice(PKT_HEADER);
+                buf.extend_from_slice(&out.stdout);
+                buf
+            };
+
+            H1Response {
+                status_code: 200,
+                content_type: "application/x-git-upload-pack-advertisement",
+                body,
+                omit_body,
+            }
+        }
+        GitSmartHttpAction::UploadPack => {
+            if !method.eq_ignore_ascii_case("POST") {
+                return H1Response::plain_error(405, "method not allowed", false);
+            }
+
+            let Ok(mut child) = spawn_git_upload_pack(&repo_dir, false, git_protocol, nobody_uid)
+            else {
+                return H1Response::plain_error(500, "failed to spawn git upload-pack", false);
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(req_body);
+            }
+            let Ok(out) = child.wait_with_output() else {
+                return H1Response::plain_error(500, "git upload-pack failed", false);
+            };
+            if !out.status.success() {
+                return H1Response::plain_error(500, "git upload-pack failed", false);
+            }
+
+            H1Response {
+                status_code: 200,
+                content_type: "application/x-git-upload-pack-result",
+                body: out.stdout,
+                omit_body: false,
+            }
+        }
+        GitSmartHttpAction::ReceivePack => H1Response::plain_error(
+            403,
+            "git-receive-pack is disabled on read-only HTTP server",
+            omit_body,
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2444,9 +2897,26 @@ fn handle_h1_repo_sub_route(
     }
 }
 
-fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> H1Response {
+fn dispatch_h1_request(
+    handler: &GitServiceHandler,
+    req: &ParsedH1Request,
+    req_body: &[u8],
+) -> H1Response {
     let is_head = req.method.eq_ignore_ascii_case("HEAD");
     let is_get = req.method.eq_ignore_ascii_case("GET");
+
+    if let Some(git_route) = match_git_smart_http_route(&req.path) {
+        return handle_git_smart_http(
+            Path::new(&handler.config.root_dir),
+            handler.config.nobody_uid,
+            &req.method,
+            &req.query,
+            req.git_protocol.as_deref(),
+            req_body,
+            git_route,
+            is_head,
+        );
+    }
 
     let repo_sub_route = match_repo_sub_route(&req.path);
     let is_known_api = req.path == API_AUTH_STATUS_PATH
@@ -2552,7 +3022,7 @@ fn read_chunk_uninterrupted<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Resu
 
 fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::Result<()> {
     const MAX_HEADER_BYTES: usize = 32 * 1024;
-    const MAX_BODY_BYTES: usize = 64 * 1024;
+    const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
     let handler = GitServiceHandler::new(config);
     let mut buf = Vec::with_capacity(4096);
@@ -2596,9 +3066,9 @@ fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::
             buf.extend_from_slice(&scratch[..n]);
         }
 
+        let resp = dispatch_h1_request(&handler, &parsed_req, &buf[header_end..total_req_len]);
         buf.drain(..total_req_len);
 
-        let resp = dispatch_h1_request(&handler, &parsed_req);
         write_h1_response(&mut io, &resp, parsed_req.connection_close)?;
 
         if parsed_req.connection_close {
@@ -2608,7 +3078,7 @@ fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::
 }
 
 /// Serves a single TCP connection, automatically detecting HTTP/2 (`roto-grpc` unary gRPC
-/// and HTTP/2 routes) vs HTTP/1.1 (`/api/v1/...` and static asset hosting).
+/// and HTTP/2 routes) vs HTTP/1.1 (`/api/v1/...`, Git Smart HTTP, and static asset hosting).
 pub fn serve_tcp_stream(mut stream: TcpStream, config: ServerConfig) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
@@ -2632,7 +3102,7 @@ pub fn serve_tcp_stream(mut stream: TcpStream, config: ServerConfig) -> io::Resu
     let io = PrefixedStream::new(prefix, stream);
 
     if is_h2 {
-        let static_service = StaticAssetService::new(&config.static_dir);
+        let static_service = StaticAssetService::with_config(&config);
         let git_service = GitServiceHandler::new(config).into_server();
         let routes: [&dyn Route; 2] = [&git_service, &static_service];
         let mut msg_buf = vec![0u8; 512 * 1024];
@@ -2808,6 +3278,7 @@ mod tests {
         assert_eq!(cfg.listen_addr, "0.0.0.0:8080");
         assert_eq!(cfg.root_dir, "/");
         assert_eq!(cfg.ssh_host, "localhost");
+        assert_eq!(cfg.https_host, "localhost");
         assert_eq!(cfg.static_dir, "/app/dist");
         assert_eq!(cfg.max_token_ttl_secs, 2_592_000);
         assert_eq!(cfg.nobody_uid, 65_534);
@@ -2820,6 +3291,7 @@ mod tests {
             "RO_GIT_LISTEN_ADDR" => Some(String::from(" 127.0.0.1:9090 ")),
             "RO_GIT_ROOT" => Some(String::from(" /srv/ro-git ")),
             "RO_GIT_SSH_HOST" => Some(String::from(" git.example.com:2222 ")),
+            "RO_GIT_HTTPS_HOST" => Some(String::from(" https://git.example.com:8443/ ")),
             "RO_GIT_STATIC_DIR" => Some(String::from(" /var/www/ro-git ")),
             "RO_GIT_MAX_TOKEN_TTL_SECS" => Some(String::from(" 86400 ")),
             "RO_GIT_NOBODY_UID" => Some(String::from(" 10001 ")),
@@ -2829,10 +3301,30 @@ mod tests {
         assert_eq!(cfg.listen_addr, "127.0.0.1:9090");
         assert_eq!(cfg.root_dir, "/srv/ro-git");
         assert_eq!(cfg.ssh_host, "git.example.com:2222");
+        assert_eq!(cfg.https_host, "git.example.com:8443");
         assert_eq!(cfg.static_dir, "/var/www/ro-git");
         assert_eq!(cfg.max_token_ttl_secs, 86_400);
         assert_eq!(cfg.nobody_uid, 10_001);
         assert_eq!(cfg.dev_user.as_deref(), Some("alice"));
+
+        let pub_url_cfg = ServerConfig::from_lookup(|key| match key {
+            "RO_GIT_PUBLIC_URL" => Some(String::from("https://code.example.org/")),
+            _ => None,
+        });
+        assert_eq!(pub_url_cfg.https_host, "code.example.org");
+
+        let cli_cfg = ServerConfig::default().with_cli_args(&[
+            String::from("--ssh-host=ssh.example.org"),
+            String::from("--https-host"),
+            String::from("https://git.example.org/"),
+        ]);
+        assert_eq!(cli_cfg.ssh_host, "ssh.example.org");
+        assert_eq!(cli_cfg.https_host, "git.example.org");
+
+        let cli_pub_cfg = ServerConfig::default().with_cli_args(&[
+            String::from("--public-url=https://pub.example.org/"),
+        ]);
+        assert_eq!(cli_pub_cfg.https_host, "pub.example.org");
 
         let fallback = ServerConfig::from_lookup(|key| match key {
             "RO_GIT_LISTEN_ADDR" => Some(String::from("   ")),
@@ -2846,6 +3338,7 @@ mod tests {
         let env_cfg = ServerConfig::from_env();
         assert!(!env_cfg.listen_addr.is_empty());
         assert!(!env_cfg.ssh_host.is_empty());
+        assert!(!env_cfg.https_host.is_empty());
     }
 
     #[test]
@@ -2866,6 +3359,7 @@ mod tests {
         assert!(!anon_auth_view.authenticated().unwrap());
         assert_eq!(anon_auth_view.username().unwrap(), "");
         assert_eq!(anon_auth_view.ssh_host().unwrap(), "localhost");
+        assert_eq!(anon_auth_view.https_host().unwrap(), "localhost");
 
         let repos_req = HttpRequest::from_uri(HttpMethod::Get, API_REPOSITORIES_PATH, None, &[]);
         let mut writer = BackwardWriter::new(&mut out_buf);
@@ -2878,10 +3372,12 @@ mod tests {
             ListRepositoriesResponseView::from_bytes(anon_repos_resp.body).unwrap();
         assert_eq!(anon_repos_view.authenticated_user().unwrap(), "");
         assert_eq!(anon_repos_view.ssh_host().unwrap(), "localhost");
+        assert_eq!(anon_repos_view.https_host().unwrap(), "localhost");
 
         // 2. Authenticated handler (`dev_user: Some("charles")`)
         let cfg = ServerConfig {
             ssh_host: String::from("git.team.internal"),
+            https_host: String::from("git.team.internal"),
             dev_user: Some(String::from("charles")),
             ..ServerConfig::default()
         };
@@ -2897,6 +3393,7 @@ mod tests {
         assert!(auth_view.authenticated().unwrap());
         assert_eq!(auth_view.username().unwrap(), "charles");
         assert_eq!(auth_view.ssh_host().unwrap(), "git.team.internal");
+        assert_eq!(auth_view.https_host().unwrap(), "git.team.internal");
 
         let mut writer = BackwardWriter::new(&mut out_buf);
         let repos_resp = server
@@ -2907,6 +3404,7 @@ mod tests {
         let repos_view = ListRepositoriesResponseView::from_bytes(repos_resp.body).unwrap();
         assert_eq!(repos_view.authenticated_user().unwrap(), "charles");
         assert_eq!(repos_view.ssh_host().unwrap(), "git.team.internal");
+        assert_eq!(repos_view.https_host().unwrap(), "git.team.internal");
         assert_eq!(repos_view.repositories().count(), 0);
     }
 
@@ -3155,6 +3653,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let anon_repos = discover_repositories(
             root,
             "git.example.com",
+            "git.example.com",
             &anon_creds,
             &RepositoryFilter::default(),
         );
@@ -3174,6 +3673,14 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             anon_repos[0].clone_command,
             "git clone ssh://git.example.com/teams/core/public/ro-git.git"
         );
+        assert_eq!(
+            anon_repos[0].https_url,
+            "https://git.example.com/teams/core/public/ro-git.git"
+        );
+        assert_eq!(
+            anon_repos[0].https_clone_command,
+            "git clone https://git.example.com/teams/core/public/ro-git.git"
+        );
 
         // 2. Alice sees all public repos + her own private repos + team `core` private repos (not bob's or `ops` private)
         let alice_creds =
@@ -3185,6 +3692,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
 
         let alice_repos = discover_repositories(
             root,
+            "git.example.com",
             "git.example.com",
             &alice_creds,
             &RepositoryFilter::default(),
@@ -3207,10 +3715,14 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             alice_repos[0].clone_command,
             "git clone ssh://alice@git.example.com/teams/core/private/roadmap.git"
         );
+        // Private repositories do not expose HTTPS URLs
+        assert_eq!(alice_repos[0].https_url, "");
+        assert_eq!(alice_repos[0].https_clone_command, "");
 
         // 3. Test scope, owner, visibility, and case-insensitive query filters
         let filtered = discover_repositories(
             root,
+            "git.example.com",
             "git.example.com",
             &alice_creds,
             &RepositoryFilter {
@@ -3237,6 +3749,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let server = GitServiceHandler::new(ServerConfig {
             root_dir: root.to_string_lossy().into_owned(),
             ssh_host: String::from("git.example.com"),
+            https_host: String::from("git.example.com"),
             ..ServerConfig::default()
         })
         .into_server();
@@ -3256,6 +3769,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let auth_view = GetAuthStatusResponseView::from_bytes(&lpm[5..]).unwrap();
         assert!(auth_view.authenticated().unwrap());
         assert_eq!(auth_view.username().unwrap(), "alice");
+        assert_eq!(auth_view.https_host().unwrap(), "git.example.com");
 
         let mut meta = ctx.metadata();
         let mut writer = BackwardWriter::new(&mut out_buf);
@@ -3265,6 +3779,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let lpm = writer.finish().unwrap();
         let repos_view = ListRepositoriesResponseView::from_bytes(&lpm[5..]).unwrap();
         assert_eq!(repos_view.authenticated_user().unwrap(), "alice");
+        assert_eq!(repos_view.https_host().unwrap(), "git.example.com");
         assert_eq!(repos_view.repositories().count(), 5);
 
         // Invalid bearer token returns GrpcCode::Unauthenticated
@@ -3394,6 +3909,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let empty_repo = inspect_repository(
             root,
             "git.example.com",
+            "git.example.com",
             &anon_creds,
             "users",
             "alice",
@@ -3431,6 +3947,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             inspect_repository(
                 root,
                 "git.example.com",
+                "git.example.com",
                 &anon_creds,
                 "users",
                 "alice",
@@ -3447,6 +3964,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         let repo_insp = inspect_repository(
             root,
             "git.example.com",
+            "git.example.com",
             &alice_creds,
             "users",
             "alice",
@@ -3459,6 +3977,14 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
         assert_eq!(
             repo_insp.repository.clone_command,
             "git clone ssh://alice@git.example.com/users/alice/public/project.git"
+        );
+        assert_eq!(
+            repo_insp.repository.https_url,
+            "https://git.example.com/users/alice/public/project.git"
+        );
+        assert_eq!(
+            repo_insp.repository.https_clone_command,
+            "git clone https://git.example.com/users/alice/public/project.git"
         );
         assert_eq!(repo_insp.head_ref, "main");
         assert_eq!(repo_insp.head_oid.len(), 40);
@@ -3671,6 +4197,7 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             inspect_repository(
                 root,
                 "git.example.com",
+                "git.example.com",
                 &anon_creds,
                 "users",
                 "alice",
@@ -3682,8 +4209,9 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             .0,
             GrpcCode::NotFound
         );
-        assert!(inspect_repository(
+        let priv_insp = inspect_repository(
             root,
+            "git.example.com",
             "git.example.com",
             &alice_creds,
             "users",
@@ -3692,12 +4220,15 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             "secret",
             "",
         )
-        .is_ok());
+        .expect("alice can inspect her private repository");
+        assert_eq!(priv_insp.repository.https_url, "");
+        assert_eq!(priv_insp.repository.https_clone_command, "");
 
         // Invalid revision (--flag injection) and path traversal must return InvalidArgument
         assert_eq!(
             inspect_repository(
                 root,
+                "git.example.com",
                 "git.example.com",
                 &anon_creds,
                 "users",

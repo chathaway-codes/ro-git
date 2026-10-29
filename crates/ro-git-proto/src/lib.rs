@@ -250,6 +250,23 @@ pub fn normalize_ssh_host(ssh_host: &str) -> &str {
     }
 }
 
+/// Normalizes an HTTPS host string by trimming leading `https://` or `http://` and trailing `/` characters.
+#[inline]
+#[must_use]
+pub fn normalize_https_host(https_host: &str) -> &str {
+    let trimmed = https_host.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme.trim_end_matches('/');
+    if host.is_empty() {
+        "localhost"
+    } else {
+        host
+    }
+}
+
 /// Formats the canonical 4-segment repository path:
 /// `/<scope>/<owner>/<visibility>/<name>.git`
 #[must_use]
@@ -352,6 +369,44 @@ pub fn format_clone_command(
     let url =
         format_authenticated_ssh_url(ssh_host, authenticated_user, scope, owner, visibility, name);
     format!("git clone {url}")
+}
+
+/// Formats the raw HTTPS URL for a public repository:
+/// - Public (`visibility == "public"`): `https://<host>/<scope>/<owner>/public/<name>.git`
+/// - Non-public: `""` (empty string)
+#[must_use]
+pub fn format_https_url(
+    https_host: &str,
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+) -> String {
+    if visibility != VISIBILITY_PUBLIC {
+        return String::new();
+    }
+    let host = normalize_https_host(https_host);
+    let path = format_canonical_path(scope, owner, visibility, name);
+    format!("https://{host}{path}")
+}
+
+/// Formats the ready-to-run HTTPS `git clone` command for a public repository:
+/// - Public (`visibility == "public"`): `git clone https://<host>/<scope>/<owner>/public/<name>.git`
+/// - Non-public: `""` (empty string)
+#[must_use]
+pub fn format_https_clone_command(
+    https_host: &str,
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    name: &str,
+) -> String {
+    let url = format_https_url(https_host, scope, owner, visibility, name);
+    if url.is_empty() {
+        String::new()
+    } else {
+        format!("git clone {url}")
+    }
 }
 
 
@@ -680,6 +735,51 @@ mod tests {
             ),
             "git clone ssh://bob@git.example.com/teams/platform/private/deploy.git"
         );
+
+        assert_eq!(normalize_https_host(""), "localhost");
+        assert_eq!(normalize_https_host("   "), "localhost");
+        assert_eq!(normalize_https_host("https:///"), "localhost");
+        assert_eq!(normalize_https_host("http:///"), "localhost");
+        assert_eq!(
+            normalize_https_host("https://git.example.com:8443/"),
+            "git.example.com:8443"
+        );
+        assert_eq!(
+            normalize_https_host("http://127.0.0.1:8080/"),
+            "127.0.0.1:8080"
+        );
+
+        assert_eq!(
+            format_https_url("git.example.com", "users", "alice", "public", "notes.git"),
+            "https://git.example.com/users/alice/public/notes.git"
+        );
+        assert_eq!(
+            format_https_url("https://localhost:8443/", "teams", "core", "public", "infra"),
+            "https://localhost:8443/teams/core/public/infra.git"
+        );
+        assert_eq!(
+            format_https_url("git.example.com", "users", "alice", "private", "secret"),
+            ""
+        );
+
+        assert_eq!(
+            format_https_clone_command("localhost", "users", "alice", "public", "notes"),
+            "git clone https://localhost/users/alice/public/notes.git"
+        );
+        assert_eq!(
+            format_https_clone_command(
+                "https://git.example.com:8443/",
+                "teams",
+                "core",
+                "public",
+                "infra.git"
+            ),
+            "git clone https://git.example.com:8443/teams/core/public/infra.git"
+        );
+        assert_eq!(
+            format_https_clone_command("git.example.com", "teams", "core", "private", "secret"),
+            ""
+        );
     }
 
     #[test]
@@ -769,6 +869,7 @@ mod tests {
         let mut buf = [0u8; 256];
         let mut builder = GetAuthStatusResponseBuilder::new(&mut buf);
         builder
+            .write_https_host("git.example.com:8443")
             .write_ssh_host("git.example.com:2222")
             .write_username("charles")
             .write_authenticated(true);
@@ -778,6 +879,7 @@ mod tests {
         assert!(view.authenticated().expect("authenticated"));
         assert_eq!(view.username().expect("username"), "charles");
         assert_eq!(view.ssh_host().expect("ssh_host"), "git.example.com:2222");
+        assert_eq!(view.https_host().expect("https_host"), "git.example.com:8443");
     }
 
     #[test]
@@ -805,6 +907,7 @@ mod tests {
         let mut resp_buf = [0u8; 1024];
         let mut resp_builder = ListRepositoriesResponseBuilder::new(&mut resp_buf);
         resp_builder
+            .write_https_host("git.local:8443")
             .write_ssh_host("git.local")
             .write_authenticated_user("alice");
 
@@ -813,8 +916,13 @@ mod tests {
             let ssh_url = format_ssh_url("git.local", scope, owner, vis, name);
             let clone_cmd =
                 format_clone_command("git.local", Some("alice"), scope, owner, vis, name);
+            let https_url = format_https_url("git.local:8443", scope, owner, vis, name);
+            let https_clone_cmd =
+                format_https_clone_command("git.local:8443", scope, owner, vis, name);
             resp_builder.write_repositories(|repo| {
-                repo.write_clone_command(&clone_cmd)
+                repo.write_https_clone_command(&https_clone_cmd)
+                    .write_https_url(&https_url)
+                    .write_clone_command(&clone_cmd)
                     .write_ssh_url(&ssh_url)
                     .write_canonical_path(&canonical)
                     .write_name(name)
@@ -830,6 +938,7 @@ mod tests {
             ListRepositoriesResponseView::from_bytes(resp_bytes).expect("decode response");
         assert_eq!(resp_view.authenticated_user().expect("user"), "alice");
         assert_eq!(resp_view.ssh_host().expect("host"), "git.local");
+        assert_eq!(resp_view.https_host().expect("https_host"), "git.local:8443");
 
         let decoded: Vec<_> = resp_view
             .repositories()
@@ -843,6 +952,8 @@ mod tests {
                     v.canonical_path().unwrap(),
                     v.ssh_url().unwrap(),
                     v.clone_command().unwrap(),
+                    v.https_url().unwrap(),
+                    v.https_clone_command().unwrap(),
                 )
             })
             .collect();
@@ -858,6 +969,8 @@ mod tests {
                     "/users/alice/public/dotfiles.git",
                     "ssh://git.local/users/alice/public/dotfiles.git",
                     "git clone ssh://alice@git.local/users/alice/public/dotfiles.git",
+                    "https://git.local:8443/users/alice/public/dotfiles.git",
+                    "git clone https://git.local:8443/users/alice/public/dotfiles.git",
                 ),
                 (
                     "teams",
@@ -867,6 +980,8 @@ mod tests {
                     "/teams/core/private/ro-git.git",
                     "ssh://git.local/teams/core/private/ro-git.git",
                     "git clone ssh://alice@git.local/teams/core/private/ro-git.git",
+                    "",
+                    "",
                 ),
             ]
         );
@@ -942,13 +1057,17 @@ mod tests {
             .write_head_oid(SAMPLE_OID_1)
             .write_head_ref("main")
             .write_repository(|repo| {
-                repo.write_clone_command("git clone ssh://git.local/users/alice/public/ro-git.git")
-                    .write_ssh_url("ssh://git.local/users/alice/public/ro-git.git")
-                    .write_canonical_path("/users/alice/public/ro-git.git")
-                    .write_name("ro-git")
-                    .write_visibility("public")
-                    .write_owner("alice")
-                    .write_scope("users");
+                repo.write_https_clone_command(
+                    "git clone https://git.local/users/alice/public/ro-git.git",
+                )
+                .write_https_url("https://git.local/users/alice/public/ro-git.git")
+                .write_clone_command("git clone ssh://git.local/users/alice/public/ro-git.git")
+                .write_ssh_url("ssh://git.local/users/alice/public/ro-git.git")
+                .write_canonical_path("/users/alice/public/ro-git.git")
+                .write_name("ro-git")
+                .write_visibility("public")
+                .write_owner("alice")
+                .write_scope("users");
             });
 
         let resp_bytes = resp_builder.finish().expect("encode GetRepositoryResponse");
@@ -959,6 +1078,14 @@ mod tests {
             .expect("decode repo")
             .expect("repo present");
         assert_eq!(repo_view.name().unwrap(), "ro-git");
+        assert_eq!(
+            repo_view.https_url().unwrap(),
+            "https://git.local/users/alice/public/ro-git.git"
+        );
+        assert_eq!(
+            repo_view.https_clone_command().unwrap(),
+            "git clone https://git.local/users/alice/public/ro-git.git"
+        );
         assert_eq!(resp_view.head_ref().unwrap(), "main");
         assert_eq!(resp_view.head_oid().unwrap(), SAMPLE_OID_1);
         assert_eq!(resp_view.resolved_revision().unwrap(), "main");
@@ -1225,6 +1352,7 @@ mod tests {
             .write_list_repositories(|lr| {
                 lr.write_owner("alice").write_scope("users");
             })
+            .write_https_host("git.example.com")
             .write_now_unix_secs(1_700_000_000)
             .write_max_token_ttl_secs(2_592_000)
             .write_ssh_host("localhost")
@@ -1236,6 +1364,7 @@ mod tests {
         assert_eq!(req_view.token().unwrap(), "payload.sig");
         assert_eq!(req_view.root_dir().unwrap(), "/srv/git");
         assert_eq!(req_view.ssh_host().unwrap(), "localhost");
+        assert_eq!(req_view.https_host().unwrap(), "git.example.com");
         assert_eq!(req_view.max_token_ttl_secs().unwrap(), 2_592_000);
         assert_eq!(req_view.now_unix_secs().unwrap(), 1_700_000_000);
 

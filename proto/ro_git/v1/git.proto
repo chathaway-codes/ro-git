@@ -7,7 +7,7 @@ import "google/api/annotations.proto";
 // Empty request for querying current authentication status and SSH host configuration.
 message GetAuthStatusRequest {}
 
-// Authentication status and public SSH host returned to the Web UI and gRPC clients.
+// Authentication status and public SSH/HTTPS hosts returned to the Web UI and gRPC clients.
 message GetAuthStatusResponse {
   // Whether the caller is authenticated as a valid user.
   bool authenticated = 1;
@@ -15,6 +15,8 @@ message GetAuthStatusResponse {
   string username = 2;
   // Public SSH hostname (and optional `:port`) for formatting `ssh://` URLs.
   string ssh_host = 3;
+  // Public HTTPS hostname (and optional `:port`) for formatting `https://` URLs.
+  string https_host = 4;
 }
 
 // Filter parameters for listing discoverable repositories.
@@ -46,6 +48,12 @@ message RepositoryInfo {
   // Ready-to-run `git clone` command (`git clone ssh://<host>/...` when anonymous,
   // or `git clone ssh://<user>@<host>/...` when authenticated).
   string clone_command = 7;
+  // Raw HTTPS URL for public repositories (e.g. `"https://localhost/users/alice/public/my-repo.git"`,
+  // or empty for private repositories).
+  string https_url = 8;
+  // Ready-to-run HTTPS `git clone` command for public repositories
+  // (e.g. `"git clone https://localhost/users/alice/public/my-repo.git"`, or empty for private repositories).
+  string https_clone_command = 9;
 }
 
 // Discoverable repositories and caller authentication context.
@@ -56,6 +64,8 @@ message ListRepositoriesResponse {
   string authenticated_user = 2;
   // Public SSH hostname (and optional `:port`) configured on the server.
   string ssh_host = 3;
+  // Public HTTPS hostname (and optional `:port`) configured on the server.
+  string https_host = 4;
 }
 
 // Git branch or tag reference metadata.
@@ -290,6 +300,8 @@ message WorkerRequest {
   uint64 max_token_ttl_secs = 5;
   // Current UNIX timestamp in seconds used for signature expiration and TTL validation.
   uint64 now_unix_secs = 6;
+  // Public HTTPS hostname (`RO_GIT_HTTPS_HOST` / `RO_GIT_PUBLIC_URL`).
+  string https_host = 7;
 
   oneof command {
     GetAuthStatusRequest get_auth_status = 10;

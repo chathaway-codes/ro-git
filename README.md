@@ -109,12 +109,15 @@ exec /usr/bin/git-shell -c "$cmd"
 ### Scope by Milestone
 - **Milestone 1 — Repository Index & Clone URLs**:
   1. List discoverable repositories grouped or filterable by owner/team (`/users/<user>/...` and `/teams/<team>/...`).
-  2. Provide one-click copy-to-clipboard buttons for each repository's clone command and raw SSH URL:
-     - Clone command: `git clone ssh://<host>/users/<owner>/public/<repo>.git` (or `ssh://<user>@<host>/...` when authenticated as `<user>`)
+  2. Provide one-click copy-to-clipboard buttons for each repository's clone command and URL, with an `SSH` / `HTTPS` protocol toggle on public repositories:
+     - SSH clone command: `git clone ssh://<host>/users/<owner>/public/<repo>.git` (or `ssh://<user>@<host>/...` when authenticated as `<user>`)
      - Raw SSH URL: `ssh://<host>/users/<owner>/public/<repo>.git`
-- **Milestone 2 — Read-Only Repository Browser & Client-Side Markdown Renderer**:
+     - HTTPS clone command (public repos only): `git clone https://<https_host>/users/<owner>/public/<repo>.git`
+     - Raw HTTPS URL (public repos only): `https://<https_host>/users/<owner>/public/<repo>.git`
+- **Milestone 2 — Read-Only Repository Browser, Smart HTTP Clone & Client-Side Markdown Renderer**:
   1. Backend strictly responds to gRPC requests for repository branches/tags, directory trees, raw file blobs, and commit history.
-  2. Client-side Markdown engine in Yew WASM (`pulldown-cmark` -> Yew `VNode`) renders `README.md` and `.md` blobs directly in the browser with safe URL filtering and relative repository link routing.
+  2. Read-only Git Smart HTTP (`GET .../info/refs?service=git-upload-pack` and `POST .../git-upload-pack`, supporting Git Wire Protocol v0/v1 and v2) for `/<scope>/<owner>/public/<name>[.git]`, spawning `git-upload-pack` as unprivileged `nobody`. Private repositories and `git-receive-pack` pushes over HTTP are rejected (`403 Forbidden`).
+  3. Client-side Markdown engine in Yew WASM (`pulldown-cmark` -> Yew `VNode`) renders `README.md` and `.md` blobs directly in the browser with safe URL filtering and relative repository link routing.
 
 ### Visibility, Stateless SSH Auth & Privilege Separation
 
@@ -151,6 +154,7 @@ flowchart LR
 | `RO_GIT_LISTEN_ADDR` | `0.0.0.0:8080` | `ro-git-server` | TCP socket address for the unified `roto-grpc` (gRPC + HTTP/1.1 + HTTP/2) server. |
 | `RO_GIT_ROOT` | `/` | `ro-git-server`, `git-auto-shell`, `git-sync-users` | Root prefix containing `users/` and `teams/` directories (e.g., `/` in container, or a temp dir in tests). |
 | `RO_GIT_SSH_HOST` | `localhost` | `ro-git-server` | Public SSH hostname (and optional `:port`, e.g., `git.example.com:2222`) used when formatting `ssh://` and `git clone` URLs in the UI. |
+| `RO_GIT_HTTPS_HOST` / `RO_GIT_PUBLIC_URL` | `localhost` | `ro-git-server` | Public HTTPS hostname or base URL (e.g., `git.example.com` or `https://git.example.com`) used when formatting HTTPS clone URLs for public repositories (terminated by an external HTTPS reverse proxy). |
 | `RO_GIT_STATIC_DIR` | `/app/dist` | `ro-git-server` | Path to compiled Yew WASM frontend assets (`index.html`, `.wasm`, `.js`). |
 | `RO_GIT_MAX_TOKEN_TTL_SECS` | `2592000` | `ro-git-server` | Maximum allowed SSH bearer token lifetime in seconds (default: 30 days). |
 | `RO_GIT_NOBODY_UID` | `65534` | `ro-git-server` | Unprivileged UID/GID used by the worker subprocess for anonymous requests. |
@@ -170,8 +174,8 @@ flowchart LR
   2. Executes `ssh-keygen -A` (`>&2`) to generate any missing OpenSSH host keys under `/etc/ssh`.
   3. **Default (no arguments)**: Starts `/usr/sbin/sshd -e` (`>&2`) in the background and `exec`s `/usr/local/bin/ro-git-server` in the foreground.
   4. **Custom command (`command [args...]`)**: After running reconciliation and host-key generation, replaces the process with `exec "$@"` (useful for one-off maintenance or inspection).
-- **`/usr/local/bin/ro-git-server [git-worker]`**:
-  - **No arguments**: Starts the HTTP/1.1 + HTTP/2 + `roto-grpc` server configured via `RO_GIT_*` environment variables.
+- **`/usr/local/bin/ro-git-server [--ssh-host <HOST>] [--https-host <HOST> | --public-url <URL>] [git-worker]`**:
+  - **Server mode**: Starts the HTTP/1.1 + HTTP/2 + `roto-grpc` server configured via `RO_GIT_*` environment variables and optional `--ssh-host` / `--https-host` / `--public-url` CLI flags.
   - **`git-worker`**: Runs as a privilege-separated single-request worker subprocess (reads one length-prefixed Protobuf `WorkerRequest` from `stdin` and writes one length-prefixed `WorkerResponse` to `stdout`).
 - **`/usr/local/bin/git-sync-users [--root <PATH>] [--etc-dir <PATH>]`**:
   - `--root <PATH>`: Root directory containing `users/` and `teams/` (overrides `RO_GIT_ROOT`, defaults to `/`).

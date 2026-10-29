@@ -13,12 +13,12 @@ use ro_git_proto::ro_git::v1::{
     RefInfoView, TreeEntryBuilder, TreeEntryView,
 };
 use ro_git_proto::{
-    format_canonical_path, format_clone_command, format_ssh_url, is_valid_identifier,
-    is_valid_oid, is_valid_revision, is_valid_scope, is_valid_visibility, normalize_repo_path,
-    normalize_revision, normalize_ssh_host, strip_git_suffix, tree_kind_from_mode,
-    DEFAULT_REVISION, DIFF_STATUS_ADDED, DIFF_STATUS_COPIED, DIFF_STATUS_DELETED,
-    DIFF_STATUS_MODIFIED, DIFF_STATUS_RENAMED, DIFF_STATUS_TYPECHANGE, TREE_KIND_DIR,
-    TREE_KIND_FILE,
+    format_canonical_path, format_clone_command, format_https_clone_command, format_https_url,
+    format_ssh_url, is_valid_identifier, is_valid_oid, is_valid_revision, is_valid_scope,
+    is_valid_visibility, normalize_https_host, normalize_repo_path, normalize_revision,
+    normalize_ssh_host, strip_git_suffix, tree_kind_from_mode, DEFAULT_REVISION, DIFF_STATUS_ADDED,
+    DIFF_STATUS_COPIED, DIFF_STATUS_DELETED, DIFF_STATUS_MODIFIED, DIFF_STATUS_RENAMED,
+    DIFF_STATUS_TYPECHANGE, TREE_KIND_DIR, TREE_KIND_FILE,
 };
 use roto_grpc::{GrpcCode, GrpcStatus};
 
@@ -153,9 +153,11 @@ pub type GitReaderError = (GrpcCode, &'static str);
 
 /// Validates `(scope, owner, visibility, name)` and resolves the bare repository path,
 /// enforcing symlink rejection, visibility access control, and directory readability.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_and_resolve_repo(
     root_dir: &Path,
     ssh_host: &str,
+    https_host: &str,
     creds: &UserCredentials,
     raw_scope: &str,
     raw_owner: &str,
@@ -196,6 +198,7 @@ pub fn validate_and_resolve_repo(
     }
 
     let normalized_host = normalize_ssh_host(ssh_host);
+    let normalized_https = normalize_https_host(https_host);
     let canonical_path = format_canonical_path(scope, owner, visibility, name);
     let ssh_url = format_ssh_url(normalized_host, scope, owner, visibility, name);
     let clone_command = format_clone_command(
@@ -206,6 +209,9 @@ pub fn validate_and_resolve_repo(
         visibility,
         name,
     );
+    let https_url = format_https_url(normalized_https, scope, owner, visibility, name);
+    let https_clone_command =
+        format_https_clone_command(normalized_https, scope, owner, visibility, name);
 
     Ok(ValidatedRepo {
         repo_dir,
@@ -217,6 +223,8 @@ pub fn validate_and_resolve_repo(
             canonical_path,
             ssh_url,
             clone_command,
+            https_url,
+            https_clone_command,
         },
     })
 }
@@ -470,6 +478,7 @@ fn read_tree_entries(
 pub fn inspect_repository(
     root_dir: &Path,
     ssh_host: &str,
+    https_host: &str,
     creds: &UserCredentials,
     scope: &str,
     owner: &str,
@@ -477,8 +486,9 @@ pub fn inspect_repository(
     name: &str,
     raw_revision: &str,
 ) -> Result<RepositoryInspection, GitReaderError> {
-    let validated =
-        validate_and_resolve_repo(root_dir, ssh_host, creds, scope, owner, visibility, name)?;
+    let validated = validate_and_resolve_repo(
+        root_dir, ssh_host, https_host, creds, scope, owner, visibility, name,
+    )?;
     let (norm_rev, rev_was_empty) = validate_revision_param(raw_revision)?;
     let repo_dir = &validated.repo_dir;
 
@@ -562,8 +572,9 @@ pub fn inspect_tree(
     raw_revision: &str,
     raw_path: &str,
 ) -> Result<TreeInspection, GitReaderError> {
-    let validated =
-        validate_and_resolve_repo(root_dir, ssh_host, creds, scope, owner, visibility, name)?;
+    let validated = validate_and_resolve_repo(
+        root_dir, ssh_host, ssh_host, creds, scope, owner, visibility, name,
+    )?;
     let (norm_rev, rev_was_empty) = validate_revision_param(raw_revision)?;
     let path = validate_path_param(raw_path, true)?;
     let repo_dir = &validated.repo_dir;
@@ -648,8 +659,9 @@ pub fn inspect_blob(
     raw_revision: &str,
     raw_path: &str,
 ) -> Result<BlobInspection, GitReaderError> {
-    let validated =
-        validate_and_resolve_repo(root_dir, ssh_host, creds, scope, owner, visibility, name)?;
+    let validated = validate_and_resolve_repo(
+        root_dir, ssh_host, ssh_host, creds, scope, owner, visibility, name,
+    )?;
     let (norm_rev, rev_was_empty) = validate_revision_param(raw_revision)?;
     let path = validate_path_param(raw_path, false)?;
     let repo_dir = &validated.repo_dir;
@@ -762,8 +774,9 @@ pub fn inspect_commits(
     raw_limit: u32,
     offset: u32,
 ) -> Result<CommitListInspection, GitReaderError> {
-    let validated =
-        validate_and_resolve_repo(root_dir, ssh_host, creds, scope, owner, visibility, name)?;
+    let validated = validate_and_resolve_repo(
+        root_dir, ssh_host, ssh_host, creds, scope, owner, visibility, name,
+    )?;
     let (norm_rev, rev_was_empty) = validate_revision_param(raw_revision)?;
     let path = validate_path_param(raw_path, true)?;
     let repo_dir = &validated.repo_dir;
@@ -932,8 +945,9 @@ pub fn inspect_commit(
     name: &str,
     raw_revision: &str,
 ) -> Result<CommitDetailInspection, GitReaderError> {
-    let validated =
-        validate_and_resolve_repo(root_dir, ssh_host, creds, scope, owner, visibility, name)?;
+    let validated = validate_and_resolve_repo(
+        root_dir, ssh_host, ssh_host, creds, scope, owner, visibility, name,
+    )?;
     let (norm_rev, rev_was_empty) = validate_revision_param(raw_revision)?;
     let repo_dir = &validated.repo_dir;
 
@@ -1263,6 +1277,8 @@ pub fn copy_get_repository_response(
             canonical_path: repo_view.canonical_path().unwrap_or("").to_owned(),
             ssh_url: repo_view.ssh_url().unwrap_or("").to_owned(),
             clone_command: repo_view.clone_command().unwrap_or("").to_owned(),
+            https_url: repo_view.https_url().unwrap_or("").to_owned(),
+            https_clone_command: repo_view.https_clone_command().unwrap_or("").to_owned(),
         },
         head_ref: view.head_ref().unwrap_or("").to_owned(),
         head_oid: view.head_oid().unwrap_or("").to_owned(),
@@ -1386,6 +1402,10 @@ pub(crate) fn push_repository_info_json(
     crate::push_json_escaped(out, r.ssh_url().unwrap_or(""));
     out.push_str(",\"clone_command\":");
     crate::push_json_escaped(out, r.clone_command().unwrap_or(""));
+    out.push_str(",\"https_url\":");
+    crate::push_json_escaped(out, r.https_url().unwrap_or(""));
+    out.push_str(",\"https_clone_command\":");
+    crate::push_json_escaped(out, r.https_clone_command().unwrap_or(""));
     out.push('}');
 }
 
@@ -1694,6 +1714,7 @@ mod tests {
         for rev in ["", "HEAD"] {
             let repo = inspect_repository(
                 &root,
+                "git.example.com",
                 "git.example.com",
                 &creds,
                 "users",
