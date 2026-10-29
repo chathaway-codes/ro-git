@@ -22,6 +22,7 @@ wasm-bindgen = { workspace = true, features = ["std"] }
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 gloo-timers.workspace = true
+pulldown-cmark.workspace = true
 web-sys = { workspace = true, features = [
     "Clipboard",
     "Headers",
