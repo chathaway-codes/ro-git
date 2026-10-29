@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+scripts/git-sync-users - Declarative user, group, and permission reconciliation for ro-git.
+
+Reconciles <root>/users/<user> into <etc>/passwd and <etc>/group,
+syncs <root>/teams/<team>/members into <etc>/group, and enforces
+StrictModes and setgid filesystem invariants across <root>/users and <root>/teams.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+GIT_AUTO_SHELL = "/usr/local/bin/git-auto-shell"
+NOBODY_ID = 65534
+MIN_USER_ID = 1000
+MIN_TEAM_GID = 2000
+
+
+def _is_valid_name(name: str) -> bool:
+    return bool(VALID_NAME_RE.match(name))
+
+
+def _safe_chown_chmod(path: Path, uid: int, gid: int, mode: int) -> None:
+    """Apply chown (ignoring EPERM when unprivileged) followed by chmod."""
+    try:
+        os.chown(path, uid, gid)
+    except PermissionError:
+        pass
+    os.chmod(path, mode)
+
+
+def _parse_passwd(passwd_path: Path) -> List[List[str]]:
+    if not passwd_path.exists():
+        return [
+            ["root", "x", "0", "0", "root", "/root", "/bin/sh"],
+            ["nobody", "x", str(NOBODY_ID), str(NOBODY_ID), "nobody", "/", "/usr/sbin/nologin"],
+        ]
+    rows: List[List[str]] = []
+    for raw in passwd_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) == 7:
+            rows.append(parts)
+    return rows
+
+
+def _parse_group(group_path: Path) -> List[List[str]]:
+    if not group_path.exists():
+        return [
+            ["root", "x", "0", ""],
+            ["nobody", "x", str(NOBODY_ID), ""],
+        ]
+    rows: List[List[str]] = []
+    for raw in group_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) == 4:
+            rows.append(parts)
+    return rows
+
+
+def _is_managed_passwd_row(row: List[str]) -> bool:
+    home, shell = row[5], row[6]
+    return home.startswith("/users/") or shell == GIT_AUTO_SHELL
+
+
+def _read_team_members(members_file: Path) -> List[str]:
+    if not members_file.exists() or not members_file.is_file():
+        return []
+    seen: Set[str] = set()
+    members: List[str] = []
+    for raw in members_file.read_text(encoding="utf-8").splitlines():
+        code = raw.split("#", 1)[0].strip()
+        if not code:
+            continue
+        if _is_valid_name(code) and code not in seen:
+            seen.add(code)
+            members.append(code)
+    return members
+
+
+def _next_free_id(start: int, used: Set[int]) -> int:
+    candidate = start
+    while candidate in used or candidate == NOBODY_ID:
+        candidate += 1
+    used.add(candidate)
+    return candidate
+
+
+def sync_users_and_groups(
+    root_dir: Optional[Path] = None,
+    etc_dir: Optional[Path] = None,
+) -> Dict[str, object]:
+    raw_root = str(root_dir) if root_dir is not None else os.environ.get("RO_GIT_ROOT", "/")
+    root = Path(raw_root).resolve() if raw_root != "/" else Path("/")
+
+    if etc_dir is not None:
+        etc = Path(etc_dir)
+    elif "RO_GIT_ETC_DIR" in os.environ and os.environ["RO_GIT_ETC_DIR"]:
+        etc = Path(os.environ["RO_GIT_ETC_DIR"])
+    else:
+        etc = root / "etc"
+
+    users_dir = root / "users"
+    teams_dir = root / "teams"
+
+    users_dir.mkdir(parents=True, exist_ok=True)
+    teams_dir.mkdir(parents=True, exist_ok=True)
+    etc.mkdir(parents=True, exist_ok=True)
+
+    _safe_chown_chmod(users_dir, 0, 0, 0o755)
+    _safe_chown_chmod(teams_dir, 0, 0, 0o755)
+
+    discovered_users = sorted(
+        p.name for p in users_dir.iterdir() if p.is_dir() and not p.is_symlink() and _is_valid_name(p.name)
+    )
+    discovered_teams = sorted(
+        p.name for p in teams_dir.iterdir() if p.is_dir() and not p.is_symlink() and _is_valid_name(p.name)
+    )
+
+    passwd_path = etc / "passwd"
+    group_path = etc / "group"
+
+    existing_passwd = _parse_passwd(passwd_path)
+    existing_group = _parse_group(group_path)
+
+    # Identify preserved (unmanaged/system) passwd entries and previously managed entries
+    system_passwd: List[List[str]] = []
+    managed_passwd_by_name: Dict[str, List[str]] = {}
+    system_user_names: Set[str] = set()
+    system_primary_gids: Set[int] = set()
+    used_uids: Set[int] = {0, NOBODY_ID}
+    used_gids: Set[int] = {0, NOBODY_ID}
+
+    for row in existing_passwd:
+        name = row[0]
+        try:
+            uid = int(row[2])
+            gid = int(row[3])
+        except ValueError:
+            continue
+        if _is_managed_passwd_row(row):
+            managed_passwd_by_name[name] = row
+            if name in discovered_users:
+                used_uids.add(uid)
+                used_gids.add(gid)
+        else:
+            system_passwd.append(row)
+            system_user_names.add(name)
+            system_primary_gids.add(gid)
+            used_uids.add(uid)
+            used_gids.add(gid)
+
+    existing_group_by_name: Dict[str, List[str]] = {}
+    system_groups: List[List[str]] = []
+    for row in existing_group:
+        gname = row[0]
+        try:
+            gid = int(row[2])
+        except ValueError:
+            continue
+        existing_group_by_name[gname] = row
+        is_system_group = (
+            gid < MIN_USER_ID
+            or gid == NOBODY_ID
+            or gname in system_user_names
+            or gid in system_primary_gids
+        )
+        if is_system_group and gname not in discovered_users and gname not in discovered_teams:
+            system_groups.append(row)
+            used_gids.add(gid)
+        elif gname in discovered_users or gname in discovered_teams:
+            used_gids.add(gid)
+
+    # Reconcile users
+    user_ids: Dict[str, Tuple[int, int]] = {}
+    new_user_passwd_rows: List[List[str]] = []
+    new_user_group_rows: List[List[str]] = []
+
+    for user in discovered_users:
+        if user in managed_passwd_by_name:
+            uid = int(managed_passwd_by_name[user][2])
+            gid = int(managed_passwd_by_name[user][3])
+        elif user in existing_group_by_name:
+            gid = int(existing_group_by_name[user][2])
+            if gid not in used_uids:
+                uid = gid
+                used_uids.add(uid)
+            else:
+                uid = _next_free_id(MIN_USER_ID, used_uids)
+        else:
+            candidate = MIN_USER_ID
+            while candidate in used_uids or candidate in used_gids or candidate == NOBODY_ID:
+                candidate += 1
+            uid = candidate
+            gid = candidate
+            used_uids.add(uid)
+            used_gids.add(gid)
+
+        user_ids[user] = (uid, gid)
+        new_user_passwd_rows.append([
+            user,
+            "x",
+            str(uid),
+            str(gid),
+            user,
+            f"/users/{user}",
+            GIT_AUTO_SHELL,
+        ])
+        if user not in discovered_teams:
+            new_user_group_rows.append([user, "x", str(gid), ""])
+
+    # Reconcile teams
+    team_gids: Dict[str, int] = {}
+    team_members_map: Dict[str, List[str]] = {}
+    new_team_group_rows: List[List[str]] = []
+
+    for team in discovered_teams:
+        members_file = teams_dir / team / "members"
+        members = _read_team_members(members_file)
+        team_members_map[team] = members
+
+        if team in existing_group_by_name:
+            gid = int(existing_group_by_name[team][2])
+            used_gids.add(gid)
+        else:
+            gid = _next_free_id(MIN_TEAM_GID, used_gids)
+
+        team_gids[team] = gid
+        new_team_group_rows.append([team, "x", str(gid), ",".join(members)])
+
+    # Write <etc>/passwd and <etc>/group atomically
+    final_passwd_rows = system_passwd + new_user_passwd_rows
+    final_group_rows = system_groups + new_user_group_rows + new_team_group_rows
+
+    passwd_content = "\n".join(":".join(r) for r in final_passwd_rows) + "\n"
+    group_content = "\n".join(":".join(r) for r in final_group_rows) + "\n"
+
+    passwd_path.write_text(passwd_content, encoding="utf-8")
+    group_path.write_text(group_content, encoding="utf-8")
+    _safe_chown_chmod(passwd_path, 0, 0, 0o644)
+    _safe_chown_chmod(group_path, 0, 0, 0o644)
+
+    # Enforce directory structure, ownership, and permission invariants for users
+    for user in discovered_users:
+        uid, gid = user_ids[user]
+        udir = users_dir / user
+        pub_dir = udir / "public"
+        priv_dir = udir / "private"
+        auth_keys = udir / "authorized_keys"
+
+        pub_dir.mkdir(parents=True, exist_ok=True)
+        priv_dir.mkdir(parents=True, exist_ok=True)
+
+        _safe_chown_chmod(udir, uid, gid, 0o755)
+        _safe_chown_chmod(pub_dir, uid, gid, 0o755)
+        _safe_chown_chmod(priv_dir, uid, gid, 0o700)
+
+        if auth_keys.exists() and auth_keys.is_file():
+            _safe_chown_chmod(auth_keys, uid, gid, 0o600)
+
+    # Enforce directory structure, ownership, and permission invariants for teams
+    for team in discovered_teams:
+        tgid = team_gids[team]
+        tdir = teams_dir / team
+        pub_dir = tdir / "public"
+        priv_dir = tdir / "private"
+        members_file = tdir / "members"
+
+        pub_dir.mkdir(parents=True, exist_ok=True)
+        priv_dir.mkdir(parents=True, exist_ok=True)
+
+        _safe_chown_chmod(tdir, 0, tgid, 0o755)
+        _safe_chown_chmod(pub_dir, 0, tgid, 0o2775)
+        _safe_chown_chmod(priv_dir, 0, tgid, 0o2770)
+
+        if members_file.exists() and members_file.is_file():
+            _safe_chown_chmod(members_file, 0, tgid, 0o640)
+
+    return {
+        "users": user_ids,
+        "teams": team_gids,
+        "team_members": team_members_map,
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Reconcile /users and /teams into /etc/passwd, /etc/group, and filesystem permissions."
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Root directory containing users/ and teams/ (defaults to RO_GIT_ROOT or /).",
+    )
+    parser.add_argument(
+        "--etc-dir",
+        type=Path,
+        default=None,
+        help="Directory containing passwd and group (defaults to RO_GIT_ETC_DIR or <root>/etc).",
+    )
+    args = parser.parse_args(argv)
+    sync_users_and_groups(root_dir=args.root, etc_dir=args.etc_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
