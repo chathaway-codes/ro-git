@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod markdown;
+pub mod repo_browser;
 
 pub use app::App;
 pub use markdown::{
@@ -9,6 +10,7 @@ pub use markdown::{
     render_vnode_to_html_string, resolve_markdown_url, MarkdownContext, MarkdownProps,
     MarkdownView,
 };
+pub use repo_browser::*;
 
 use ro_git_proto::ro_git::v1::{GetAuthStatusResponseView, ListRepositoriesResponseView};
 use ro_git_proto::{
@@ -188,6 +190,21 @@ impl RepositoryItem {
     #[must_use]
     pub fn group_path(&self) -> String {
         format!("/{}/{}", self.scope, self.owner)
+    }
+
+    /// Returns the client-side repository overview route (`"/<scope>/<owner>/<visibility>/<name>"`).
+    #[must_use]
+    pub fn root_route(&self) -> String {
+        format!(
+            "/{}/{}/{}/{}",
+            self.scope, self.owner, self.visibility, self.name
+        )
+    }
+
+    /// Converts this item into [`RepoCoordinates`] if all 4 segments are valid.
+    #[must_use]
+    pub fn coordinates(&self) -> Option<RepoCoordinates> {
+        RepoCoordinates::new(&self.scope, &self.owner, &self.visibility, &self.name)
     }
 
     /// Computes the `ssh://` URL for the given `ssh_host` and optional `authenticated_user`.

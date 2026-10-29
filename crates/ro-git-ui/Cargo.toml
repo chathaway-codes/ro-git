@@ -26,11 +26,13 @@ pulldown-cmark.workspace = true
 web-sys = { workspace = true, features = [
     "Clipboard",
     "Headers",
+    "History",
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "Location",
     "Navigator",
+    "PopStateEvent",
     "Request",
     "RequestInit",
     "Response",

@@ -991,6 +991,13 @@ pub fn markdown_view(props: &MarkdownProps) -> Html {
     render_markdown(props.markdown.as_str(), props.context.as_ref())
 }
 
+impl MarkdownView {
+    /// Renders [`MarkdownProps`] directly into a [`VNode`] tree.
+    pub fn render(props: &MarkdownProps) -> Html {
+        render_markdown(props.markdown.as_str(), props.context.as_ref())
+    }
+}
+
 /// Serializes a Yew [`VNode`] tree into an HTML string for deterministic inspection
 /// and unit testing, escaping text nodes and attribute values.
 #[must_use]
