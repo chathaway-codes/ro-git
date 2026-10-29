@@ -413,12 +413,17 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
         self.assertIn("/usr/local/bin/git-auto-shell", dockerfile)
         self.assertIn("/usr/local/bin/git-sync-users", dockerfile)
         self.assertIn("/usr/local/bin/docker-entrypoint.sh", dockerfile)
+        self.assertIn("/usr/local/share/ro-git/sshd_config", dockerfile)
         self.assertIn("/etc/ssh/sshd_config", dockerfile)
         self.assertIn("EXPOSE 22 8080", dockerfile)
         self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]', dockerfile)
 
         entrypoint_text = (REPO_ROOT / "scripts" / "docker-entrypoint.sh").read_text(encoding="utf-8")
         self.assertIn('SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"', entrypoint_text)
+        self.assertIn(
+            'SSHD_CONFIG_DEFAULT_PATH="${SSHD_CONFIG_DEFAULT_PATH:-/usr/local/share/ro-git/sshd_config}"',
+            entrypoint_text,
+        )
 
     def test_docker_entrypoint_default_and_custom_command(self):
         entrypoint = REPO_ROOT / "scripts" / "docker-entrypoint.sh"
@@ -427,6 +432,7 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             log_file = tmp_dir / "calls.log"
+            seeded_sshd_config = tmp_dir / "etc" / "ssh" / "sshd_config"
 
             def make_stub(name: str) -> Path:
                 p = tmp_dir / name
@@ -455,10 +461,19 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
             env["SSH_KEYGEN_BIN"] = str(keygen_stub)
             env["SSHD_BIN"] = str(sshd_stub)
             env["RO_GIT_SERVER_BIN"] = str(server_stub)
+            env["SSHD_CONFIG_PATH"] = str(seeded_sshd_config)
+            env["SSHD_CONFIG_DEFAULT_PATH"] = str(SSHD_CONFIG_PATH)
 
+            self.assertFalse(seeded_sshd_config.exists())
             res = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout, "")
+            self.assertTrue(seeded_sshd_config.is_file(), "sshd_config must be auto-seeded when missing")
+            self.assertEqual(stat.S_IMODE(seeded_sshd_config.stat().st_mode), 0o644)
+            self.assertEqual(
+                seeded_sshd_config.read_text(encoding="utf-8"),
+                SSHD_CONFIG_PATH.read_text(encoding="utf-8"),
+            )
             self.assertEqual(
                 log_file.read_text(encoding="utf-8").splitlines(),
                 [
@@ -469,7 +484,9 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
                 ],
             )
 
-            # Verify custom command passthrough
+            # Verify existing sshd_config is preserved and custom command passthrough works
+            custom_cfg = "# custom sshd_config\nPort 2222\n"
+            seeded_sshd_config.write_text(custom_cfg, encoding="utf-8")
             log_file.unlink()
             res_cmd = subprocess.run(
                 [str(entrypoint), "printf", "%s", "custom-ok"],
@@ -479,6 +496,7 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
             )
             self.assertEqual(res_cmd.returncode, 0, res_cmd.stderr)
             self.assertEqual(res_cmd.stdout, "custom-ok")
+            self.assertEqual(seeded_sshd_config.read_text(encoding="utf-8"), custom_cfg)
             self.assertEqual(
                 log_file.read_text(encoding="utf-8").splitlines(),
                 [

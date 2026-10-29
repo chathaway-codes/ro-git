@@ -1132,14 +1132,22 @@ pub fn spawn_worker_subprocess(
         .stderr(Stdio::piped());
 
     // SAFETY: `geteuid` has no preconditions. When running as root (`UID 0`), drop
-    // supplementary groups, primary GID, and UID in the child process before exec.
+    // supplementary groups, primary GID, and UID in POSIX order inside `pre_exec`
+    // before `exec`. (`CommandExt::uid` / `gid` run before `pre_exec` in `std`,
+    // which would drop `CAP_SETGID` before `setgroups` runs.)
     if unsafe { libc::geteuid() == 0 } {
+        let uid = creds.uid;
+        let gid = creds.gid;
         let gids: Vec<libc::gid_t> = creds.supplementary_gids.clone();
-        cmd.uid(creds.uid).gid(creds.gid);
         unsafe {
             cmd.pre_exec(move || {
-                let rc = libc::setgroups(gids.len(), gids.as_ptr());
-                if rc != 0 {
+                if libc::setgroups(gids.len(), gids.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -1180,8 +1188,10 @@ pub fn dispatch_worker_request(
     req_bytes: &[u8],
 ) -> Result<Vec<u8>, GrpcStatus<'static>> {
     if let Some(worker_bin) = find_worker_binary() {
-        spawn_worker_subprocess(&worker_bin, creds, req_bytes)
-            .map_err(|_| GrpcStatus::internal("git-worker subprocess execution failed"))
+        spawn_worker_subprocess(&worker_bin, creds, req_bytes).map_err(|err| {
+            eprintln!("git-worker error: {err}");
+            GrpcStatus::internal("git-worker subprocess execution failed")
+        })
     } else {
         Ok(execute_worker_request_bytes(req_bytes))
     }
