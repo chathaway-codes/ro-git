@@ -1,4 +1,4 @@
-.PHONY: help test check test-issues issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
+.PHONY: help test check test-issues test-ssh issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
 
 PROJECT_NAME ?= ro-git
 DOCKER_IMAGE ?= $(PROJECT_NAME)-workspace:latest
@@ -9,12 +9,15 @@ help: ## Show this help message
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-test: test-issues ## Run test suite
+test: test-issues test-ssh ## Run test suite
 
 check: test ## Alias for test
 
 test-issues: ## Run unit tests for git issue tracker CLI and server
 	python3 tests/test_issue_tooling.py
+
+test-ssh: ## Run unit and integration tests for SSH config, git-auto-shell, and git-sync-users
+	python3 tests/test_ssh_provisioning.py
 
 issues: ## List git issues in tabular format
 	@python3 scripts/issue.py list

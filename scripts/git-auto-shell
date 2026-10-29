@@ -1,0 +1,72 @@
+#!/bin/sh
+set -e
+
+GIT_SHELL="${GIT_SHELL_BIN:-/usr/bin/git-shell}"
+
+# Interactive SSH (no -c): let git-shell reject it
+if [ "$1" != "-c" ] || [ -z "$2" ]; then
+    exec "$GIT_SHELL" "$@"
+fi
+
+root="${RO_GIT_ROOT:-/}"
+while [ "${root%/}" != "$root" ]; do
+    root="${root%/}"
+done
+
+cmd="$2"
+
+case "$cmd" in
+    git-receive-pack\ *|git-upload-pack\ *|git-upload-archive\ *)
+        verb="${cmd%% *}"
+        raw_arg="${cmd#* }"
+
+        case "$raw_arg" in
+            \'*\')
+                repo="${raw_arg#\'}"
+                repo="${repo%\'}"
+                ;;
+            *)
+                repo="$raw_arg"
+                ;;
+        esac
+
+        if [ -n "$root" ] && [ "${repo#"$root"/}" != "$repo" ]; then
+            logical_repo="/${repo#"$root"/}"
+        else
+            logical_repo="$repo"
+        fi
+
+        case "$logical_repo" in
+            *'
+'*)
+                echo "fatal: path must be /(users|teams)/<owner>/(public|private)/<repo>.git" >&2
+                exit 1
+                ;;
+        esac
+
+        # Require exact 4-segment path: /(users|teams)/<owner>/(public|private)/<repo>.git
+        if ! printf '%s\n' "$logical_repo" | grep -Eq '^/(users|teams)/[a-zA-Z0-9_-]+/(public|private)/[a-zA-Z0-9_-]+\.git$'; then
+            echo "fatal: path must be /(users|teams)/<owner>/(public|private)/<repo>.git" >&2
+            exit 1
+        fi
+
+        repo_fs_path="${root}${logical_repo}"
+
+        if [ "$verb" = "git-receive-pack" ] && [ ! -d "$repo_fs_path" ]; then
+            case "$logical_repo" in
+                /teams/*)
+                    # --shared=group ensures all team members can write objects and refs
+                    git init --bare --initial-branch=main --shared=group --quiet -- "$repo_fs_path" >&2
+                    ;;
+                /users/*)
+                    git init --bare --initial-branch=main --quiet -- "$repo_fs_path" >&2
+                    ;;
+            esac
+        fi
+
+        effective_cmd="${verb} '${repo_fs_path}'"
+        exec "$GIT_SHELL" -c "$effective_cmd"
+        ;;
+esac
+
+exec "$GIT_SHELL" -c "$cmd"
