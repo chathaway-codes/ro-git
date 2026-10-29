@@ -405,6 +405,8 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
         self.assertIn("FROM debian:bookworm-slim AS production", dockerfile)
         self.assertIn("aarch64|arm64", dockerfile)
         self.assertIn("x86_64|amd64", dockerfile)
+        self.assertIn("BINARYEN_VERSION", dockerfile)
+        self.assertIn("bin/wasm-opt", dockerfile)
         self.assertIn("cargo build --release --locked -p ro-git-server", dockerfile)
         self.assertIn("trunk build --release --config crates/ro-git-ui/Trunk.toml --dist /build/dist", dockerfile)
         self.assertIn("/usr/local/bin/ro-git-server", dockerfile)

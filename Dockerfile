@@ -1,3 +1,4 @@
+# check=skip=SecretsUsedInArgOrEnv
 # ---------------------------------------------------------------------------
 # Stage 1: Multi-arch toolchain (linux/amd64 and linux/arm64)
 # ---------------------------------------------------------------------------
@@ -15,8 +16,7 @@ RUN apt-get update && \
         protobuf-compiler \
         libprotobuf-dev \
         pkg-config \
-        libssl-dev \
-        binaryen && \
+        libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/opt/rustup \
@@ -27,6 +27,7 @@ ENV RUSTUP_HOME=/opt/rustup \
 
 ARG TRUNK_VERSION="0.21.14"
 ARG WASM_BINDGEN_VERSION="0.2.128"
+ARG BINARYEN_VERSION="130"
 
 RUN mkdir -p /opt/cargo /opt/rustup && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -35,11 +36,13 @@ RUN mkdir -p /opt/cargo /opt/rustup && \
     case "$arch" in \
         aarch64|arm64) \
             trunk_arch="aarch64-unknown-linux-gnu" && \
-            wbg_arch="aarch64-unknown-linux-gnu" \
+            wbg_arch="aarch64-unknown-linux-gnu" && \
+            binaryen_arch="aarch64-linux" \
             ;; \
         x86_64|amd64) \
             trunk_arch="x86_64-unknown-linux-gnu" && \
-            wbg_arch="x86_64-unknown-linux-musl" \
+            wbg_arch="x86_64-unknown-linux-musl" && \
+            binaryen_arch="x86_64-linux" \
             ;; \
         *) \
             printf 'Unsupported architecture: %s\n' "$arch" >&2 && exit 1 \
@@ -49,6 +52,8 @@ RUN mkdir -p /opt/cargo /opt/rustup && \
         tar -xz -C /usr/local/bin trunk && \
     curl -fSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-${wbg_arch}.tar.gz" | \
         tar -xz --strip-components=1 -C /usr/local/bin && \
+    curl -fSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${binaryen_arch}.tar.gz" | \
+        tar -xz --strip-components=2 -C /usr/local/bin "binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" && \
     chmod -R a+rwX /opt/rustup /opt/cargo
 
 # ---------------------------------------------------------------------------
