@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ro-git-proto",
+    "crates/ro-git-server",
+    "crates/ro-git-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
+roto-runtime = { git = "https://github.com/chathaway-codes/roto", default-features = false }
+roto-grpc = { git = "https://github.com/chathaway-codes/roto", default-features = false }
+google-protobuf-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
+grpc-reflection-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
+ro-git-proto = { path = "crates/ro-git-proto", default-features = false }

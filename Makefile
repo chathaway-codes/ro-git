@@ -1,4 +1,4 @@
-.PHONY: help test check test-issues issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
+.PHONY: help test check test-issues test-rust proto issues issues-ready issues-ui clean docker-build docker-test docker-shell docker-yolo
 
 PROJECT_NAME ?= ro-git
 DOCKER_IMAGE ?= $(PROJECT_NAME)-workspace:latest
@@ -9,12 +9,21 @@ help: ## Show this help message
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-test: test-issues ## Run test suite
+test: test-issues test-rust ## Run full verification suite (issue tooling + Rust workspace + WASM check + clippy)
 
 check: test ## Alias for test
 
 test-issues: ## Run unit tests for git issue tracker CLI and server
 	python3 tests/test_issue_tooling.py
+
+test-rust: ## Run Rust workspace tests, WASM target check, and clippy lints
+	cargo test --workspace
+	cargo check --manifest-path crates/ro-git-ui/Cargo.toml --target wasm32-unknown-unknown
+	cargo clippy --workspace -- -D warnings
+
+proto: ## Regenerate roto Protobuf views, builders, and roto-grpc service traits
+	cargo roto --manifest-path crates/ro-git-proto/Cargo.toml
+
 
 issues: ## List git issues in tabular format
 	@python3 scripts/issue.py list

@@ -1,0 +1,17 @@
+[package]
+name = "ro-git-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified roto-grpc HTTP/gRPC backend and privilege-separated git-worker for ro-git"
+
+[[bin]]
+name = "ro-git-server"
+path = "src/main.rs"
+
+[dependencies]
+ro-git-proto = { workspace = true, features = ["server"] }
+roto.workspace = true
+roto-runtime.workspace = true
+roto-grpc = { workspace = true, features = ["std", "tokio"] }
+grpc-reflection-roto = { workspace = true, features = ["std", "tokio"] }
