@@ -490,13 +490,11 @@ pub fn inspect_repository(
     if head_oid.is_empty() {
         if let Some(first_branch) = branches.first() {
             head_oid = first_branch.oid.clone();
-            if head_ref.is_empty() {
-                head_ref = first_branch.name.clone();
-            }
+            head_ref = first_branch.name.clone();
         }
     }
 
-    let (resolved_revision, active_tree_oid) = if !rev_was_empty {
+    let (resolved_revision, active_tree_oid) = if !rev_was_empty && norm_rev != DEFAULT_REVISION {
         let Some(tree_oid) = resolve_tree_oid(repo_dir, norm_rev) else {
             return Err((GrpcCode::NotFound, "revision not found"));
         };
@@ -542,7 +540,7 @@ fn resolve_active_revision(
     if resolve_tree_oid(repo_dir, norm_rev).is_some() {
         return Some(norm_rev.to_owned());
     }
-    if rev_was_empty {
+    if rev_was_empty || norm_rev == DEFAULT_REVISION {
         let branches = list_branches(repo_dir);
         if let Some(first) = branches.first() {
             return Some(first.name.clone());
@@ -588,7 +586,7 @@ pub fn inspect_tree(
 
     let entries = read_tree_entries(repo_dir, &tree_oid, &path)?;
     Ok(TreeInspection {
-        revision: norm_rev.to_owned(),
+        revision: active_rev,
         tree_oid,
         path,
         entries,
@@ -682,7 +680,7 @@ pub fn inspect_blob(
     let is_binary = content[..sniff_len].contains(&0);
 
     Ok(BlobInspection {
-        revision: norm_rev.to_owned(),
+        revision: active_rev,
         path,
         oid: blob_oid,
         size,
@@ -772,7 +770,7 @@ pub fn inspect_commits(
 
     let active_rev = if resolve_commit_oid(repo_dir, norm_rev).is_some() {
         norm_rev.to_owned()
-    } else if rev_was_empty {
+    } else if rev_was_empty || norm_rev == DEFAULT_REVISION {
         let branches = list_branches(repo_dir);
         if let Some(first) = branches.first() {
             first.name.clone()
@@ -821,13 +819,13 @@ pub fn inspect_commits(
     }
 
     Ok(CommitListInspection {
-        revision: norm_rev.to_owned(),
+        revision: active_rev,
         commits,
         has_more,
     })
 }
 
-fn truncate_utf8_str(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8_str(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_owned();
     }
@@ -941,7 +939,7 @@ pub fn inspect_commit(
 
     let commit_oid = if let Some(oid) = resolve_commit_oid(repo_dir, norm_rev) {
         oid
-    } else if rev_was_empty {
+    } else if rev_was_empty || norm_rev == DEFAULT_REVISION {
         let branches = list_branches(repo_dir);
         if let Some(first) = branches.first() {
             first.oid.clone()
@@ -1624,5 +1622,159 @@ pub fn encode_get_commit_json(view: GetCommitResponseView<'_>) -> Vec<u8> {
     crate::push_json_escaped(&mut json, view.patch().unwrap_or(""));
     json.push('}');
     json.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn falls_back_to_first_branch_when_head_points_to_unborn_ref() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ro-git-reader-unborn-head-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let bare_dir = root.join("users/alice/public/unborn-head.git");
+        fs::create_dir_all(&bare_dir).unwrap();
+        let out = Command::new("git")
+            .current_dir(&bare_dir)
+            .args(["init", "--bare", "--initial-branch=unborn"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let work_dir = root.join("work");
+        fs::create_dir_all(work_dir.join("sub")).unwrap();
+        let run_git_work = |args: &[&str]| {
+            let o = Command::new("git")
+                .current_dir(&work_dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Alice")
+                .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+                .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+                .env("GIT_COMMITTER_NAME", "Alice")
+                .env("GIT_COMMITTER_EMAIL", "alice@example.com")
+                .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_git_work(&["init", "--initial-branch=main"]);
+        fs::write(work_dir.join("sub/hello.txt"), "hello unborn fallback\n").unwrap();
+        run_git_work(&["add", "."]);
+        run_git_work(&["commit", "-m", "Commit on main"]);
+        run_git_work(&["remote", "add", "origin", &bare_dir.to_string_lossy()]);
+        run_git_work(&["push", "origin", "main"]);
+
+        // Ensure bare repo HEAD still points to `refs/heads/unborn`
+        assert_eq!(
+            fs::read_to_string(bare_dir.join("HEAD")).unwrap().trim(),
+            "ref: refs/heads/unborn"
+        );
+
+        let creds = UserCredentials {
+            username: None,
+            uid: 65_534,
+            gid: 65_534,
+            supplementary_gids: Vec::new(),
+            team_names: Vec::new(),
+        };
+
+        for rev in ["", "HEAD"] {
+            let repo = inspect_repository(
+                &root,
+                "git.example.com",
+                &creds,
+                "users",
+                "alice",
+                "public",
+                "unborn-head",
+                rev,
+            )
+            .unwrap();
+            assert_eq!(repo.head_ref, "main");
+            assert_eq!(repo.resolved_revision, "main");
+            assert!(is_valid_oid(&repo.head_oid));
+            assert_eq!(repo.entries.len(), 1);
+            assert_eq!(repo.entries[0].name, "sub");
+
+            let tree = inspect_tree(
+                &root,
+                "git.example.com",
+                &creds,
+                "users",
+                "alice",
+                "public",
+                "unborn-head",
+                rev,
+                "sub",
+            )
+            .unwrap();
+            assert_eq!(tree.revision, "main");
+            assert_eq!(tree.entries.len(), 1);
+            assert_eq!(tree.entries[0].path, "sub/hello.txt");
+
+            let blob = inspect_blob(
+                &root,
+                "git.example.com",
+                &creds,
+                "users",
+                "alice",
+                "public",
+                "unborn-head",
+                rev,
+                "sub/hello.txt",
+            )
+            .unwrap();
+            assert_eq!(blob.revision, "main");
+            assert_eq!(blob.content, b"hello unborn fallback\n");
+
+            let commits = inspect_commits(
+                &root,
+                "git.example.com",
+                &creds,
+                "users",
+                "alice",
+                "public",
+                "unborn-head",
+                rev,
+                "",
+                10,
+                0,
+            )
+            .unwrap();
+            assert_eq!(commits.revision, "main");
+            assert_eq!(commits.commits.len(), 1);
+            assert_eq!(commits.commits[0].subject, "Commit on main");
+
+            let detail = inspect_commit(
+                &root,
+                "git.example.com",
+                &creds,
+                "users",
+                "alice",
+                "public",
+                "unborn-head",
+                rev,
+            )
+            .unwrap();
+            assert_eq!(detail.commit.oid, repo.head_oid);
+            assert_eq!(detail.files.len(), 1);
+            assert_eq!(detail.files[0].path, "sub/hello.txt");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 

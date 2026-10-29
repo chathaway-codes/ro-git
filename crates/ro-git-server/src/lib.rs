@@ -2,6 +2,8 @@
 //! OpenSSH `SSHSIG` stateless token verification, user/team credential resolution,
 //! and privilege-separated `git-worker` IPC and repository discovery.
 
+#![deny(unsafe_code)]
+
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -507,6 +509,7 @@ fn collect_filesystem_team_memberships(
     }
 }
 
+#[allow(unsafe_code)]
 fn resolve_or_fallback_dev_credentials(
     root_dir: &Path,
     etc_dir: Option<&Path>,
@@ -828,15 +831,13 @@ fn current_unix_secs() -> u64 {
 }
 
 fn encode_worker_error(code: GrpcCode, message: &str) -> Vec<u8> {
+    let bounded = truncate_utf8_str(message, 512);
     let mut buf = vec![0u8; 1024];
     let mut builder = WorkerResponseBuilder::new(&mut buf);
     builder
-        .write_error_message(message)
+        .write_error_message(&bounded)
         .write_status_code(code as u32);
-    builder
-        .finish()
-        .expect("worker error response fits in 1024-byte buffer")
-        .to_vec()
+    builder.finish().map(<[u8]>::to_vec).unwrap_or_default()
 }
 
 fn encode_worker_ok(
@@ -1118,6 +1119,7 @@ pub fn find_worker_binary() -> Option<PathBuf> {
 /// Spawns `ro-git-server git-worker` as a subprocess, dropping privileges to `creds`
 /// when running as `root` (`geteuid() == 0`), sending `req_bytes` over `stdin`, and
 /// returning the raw `WorkerResponse` bytes from `stdout`.
+#[allow(unsafe_code)]
 pub fn spawn_worker_subprocess(
     worker_bin: &Path,
     creds: &UserCredentials,
