@@ -399,39 +399,13 @@ pub fn resolve_user_credentials(
 
     // Also inspect `<root_dir>/teams/<team>/members` so team memberships and GIDs
     // are always resolved accurately from the repository hierarchy.
-    let teams_dir = root_dir.join(SCOPE_TEAMS);
-    if let Ok(meta) = fs::symlink_metadata(&teams_dir) {
-        if !meta.file_type().is_symlink() && meta.is_dir() {
-            if let Ok(entries) = fs::read_dir(&teams_dir) {
-                for entry in entries.flatten() {
-                    let Ok(ft) = entry.file_type() else {
-                        continue;
-                    };
-                    if ft.is_symlink() || !ft.is_dir() {
-                        continue;
-                    }
-                    let fname = entry.file_name();
-                    let Some(team_name) = fname.to_str() else {
-                        continue;
-                    };
-                    if !is_valid_identifier(team_name) {
-                        continue;
-                    }
-                    if is_user_in_team_members_file(&entry.path().join("members"), user)
-                        && !team_names.contains(&team_name.to_owned())
-                    {
-                        team_names.push(team_name.to_owned());
-                        if let Ok(team_meta) = fs::symlink_metadata(entry.path()) {
-                            let team_gid = team_meta.gid();
-                            if team_gid != gid && !supplementary_gids.contains(&team_gid) {
-                                supplementary_gids.push(team_gid);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    collect_filesystem_team_memberships(
+        root_dir,
+        user,
+        gid,
+        &mut supplementary_gids,
+        &mut team_names,
+    );
 
     supplementary_gids.sort_unstable();
     team_names.sort();
@@ -443,6 +417,88 @@ pub fn resolve_user_credentials(
         supplementary_gids,
         team_names,
     })
+}
+
+fn is_non_symlink_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+        .unwrap_or(false)
+}
+
+fn is_non_symlink_dir_entry(entry: &fs::DirEntry) -> bool {
+    entry
+        .file_type()
+        .map(|ft| !ft.is_symlink() && ft.is_dir())
+        .unwrap_or(false)
+}
+
+fn collect_filesystem_team_memberships(
+    root_dir: &Path,
+    username: &str,
+    primary_gid: u32,
+    supplementary_gids: &mut Vec<u32>,
+    team_names: &mut Vec<String>,
+) {
+    let teams_dir = root_dir.join(SCOPE_TEAMS);
+    if !is_non_symlink_dir(&teams_dir) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&teams_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if !is_non_symlink_dir_entry(&entry) {
+            continue;
+        }
+        let fname = entry.file_name();
+        let Some(team_name) = fname.to_str() else {
+            continue;
+        };
+        if !is_valid_identifier(team_name) {
+            continue;
+        }
+        if !is_user_in_team_members_file(&entry.path().join("members"), username) {
+            continue;
+        }
+        if team_names.iter().any(|t| t == team_name) {
+            continue;
+        }
+
+        team_names.push(team_name.to_owned());
+        if let Ok(team_meta) = fs::symlink_metadata(entry.path()) {
+            let team_gid = team_meta.gid();
+            if team_gid != primary_gid && !supplementary_gids.contains(&team_gid) {
+                supplementary_gids.push(team_gid);
+            }
+        }
+    }
+}
+
+fn resolve_or_fallback_dev_credentials(
+    root_dir: &Path,
+    etc_dir: Option<&Path>,
+    username: &str,
+    nobody_uid: u32,
+) -> Result<UserCredentials, AuthError> {
+    if !is_valid_identifier(username) {
+        return Err(AuthError::InvalidUsername);
+    }
+    Ok(
+        resolve_user_credentials(root_dir, etc_dir, Some(username), nobody_uid).unwrap_or_else(
+            |_| {
+                // SAFETY: `geteuid` and `getegid` are thread-safe POSIX syscalls with no preconditions.
+                let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                UserCredentials {
+                    username: Some(username.to_owned()),
+                    uid,
+                    gid,
+                    supplementary_gids: Vec::new(),
+                    team_names: Vec::new(),
+                }
+            },
+        ),
+    )
 }
 
 fn lookup_passwd_uid_gid(passwd_path: &Path, username: &str) -> Option<(u32, u32)> {
@@ -512,7 +568,7 @@ fn lookup_supplementary_groups(
                 gids.push(gid);
             }
             if let Some(team) = group_name.strip_prefix("team-") {
-                if is_valid_identifier(team) && !teams.contains(&team.to_owned()) {
+                if is_valid_identifier(team) && !teams.iter().any(|t| t == team) {
                     teams.push(team.to_owned());
                 }
             }
@@ -537,6 +593,111 @@ fn is_user_in_team_members_file(members_path: &Path, username: &str) -> bool {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .any(|member| member == username)
+}
+
+fn can_access_visibility(
+    scope: &str,
+    owner: &str,
+    owner_dir: &Path,
+    visibility: &str,
+    creds: &UserCredentials,
+) -> bool {
+    if visibility != VISIBILITY_PRIVATE {
+        return true;
+    }
+    match (scope, creds.username.as_deref()) {
+        (SCOPE_USERS, Some(user)) => user == owner,
+        (SCOPE_TEAMS, Some(user)) => {
+            creds.team_names.iter().any(|t| t == owner)
+                || is_user_in_team_members_file(&owner_dir.join("members"), user)
+        }
+        _ => false,
+    }
+}
+
+fn matches_repository_query(
+    owner: &str,
+    repo_name: &str,
+    canonical_path: &str,
+    query_lower: &str,
+) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    let owner_repo = format!("{owner}/{repo_name}").to_ascii_lowercase();
+    let name_lower = repo_name.to_ascii_lowercase();
+    let path_lower = canonical_path.to_ascii_lowercase();
+    name_lower.contains(query_lower)
+        || owner_repo.contains(query_lower)
+        || path_lower.contains(query_lower)
+}
+
+struct DiscoveryContext<'a> {
+    normalized_host: &'a str,
+    auth_user: Option<&'a str>,
+    filter_query: &'a str,
+}
+
+fn scan_visibility_dir(
+    vis_dir: &Path,
+    scope: &str,
+    owner: &str,
+    visibility: &str,
+    ctx: &DiscoveryContext<'_>,
+    discovered: &mut Vec<DiscoveredRepository>,
+) {
+    if !is_non_symlink_dir(vis_dir) {
+        return;
+    }
+    let Ok(repo_entries) = fs::read_dir(vis_dir) else {
+        // PermissionDenied or unreadable directory is silently skipped
+        return;
+    };
+
+    for repo_entry in repo_entries.flatten() {
+        if !is_non_symlink_dir_entry(&repo_entry) {
+            continue;
+        }
+        let repo_os = repo_entry.file_name();
+        let Some(dir_name) = repo_os.to_str() else {
+            continue;
+        };
+        let Some(repo_name) = dir_name.strip_suffix(".git") else {
+            continue;
+        };
+        if !is_valid_identifier(repo_name) {
+            continue;
+        }
+        // Ensure the bare repository directory itself is readable by the worker
+        if fs::read_dir(repo_entry.path()).is_err() {
+            continue;
+        }
+
+        let canonical_path = format_canonical_path(scope, owner, visibility, repo_name);
+        if !matches_repository_query(owner, repo_name, &canonical_path, ctx.filter_query) {
+            continue;
+        }
+
+        let ssh_url = format_ssh_url(ctx.normalized_host, scope, owner, visibility, repo_name);
+        let clone_command = format_clone_command(
+            ctx.normalized_host,
+            ctx.auth_user,
+            scope,
+            owner,
+            visibility,
+            repo_name,
+        );
+
+        discovered.push(DiscoveredRepository {
+            scope: scope.to_owned(),
+            owner: owner.to_owned(),
+            visibility: visibility.to_owned(),
+            name: repo_name.to_owned(),
+            canonical_path,
+            ssh_url,
+            clone_command,
+        });
+    }
 }
 
 /// Scans `<root_dir>/users` and `<root_dir>/teams` for bare `.git` repositories visible
@@ -564,8 +725,11 @@ pub fn discover_repositories(
         return Vec::new();
     }
 
-    let auth_user = creds.username.as_deref();
-    let normalized_host = normalize_ssh_host(ssh_host);
+    let ctx = DiscoveryContext {
+        normalized_host: normalize_ssh_host(ssh_host),
+        auth_user: creds.username.as_deref(),
+        filter_query: &filter_query,
+    };
     let mut discovered = Vec::new();
 
     for scope in [SCOPE_TEAMS, SCOPE_USERS] {
@@ -574,130 +738,41 @@ pub fn discover_repositories(
         }
 
         let scope_dir = root_dir.join(scope);
-        let Ok(scope_meta) = fs::symlink_metadata(&scope_dir) else {
-            continue;
-        };
-        if scope_meta.file_type().is_symlink() || !scope_meta.is_dir() {
+        if !is_non_symlink_dir(&scope_dir) {
             continue;
         }
-
         let Ok(owner_entries) = fs::read_dir(&scope_dir) else {
             continue;
         };
 
         for owner_entry in owner_entries.flatten() {
-            let Ok(owner_ft) = owner_entry.file_type() else {
-                continue;
-            };
-            if owner_ft.is_symlink() || !owner_ft.is_dir() {
+            if !is_non_symlink_dir_entry(&owner_entry) {
                 continue;
             }
-
             let owner_os = owner_entry.file_name();
             let Some(owner) = owner_os.to_str() else {
                 continue;
             };
-            if !is_valid_identifier(owner) {
-                continue;
-            }
-            if !filter_owner.is_empty() && filter_owner != owner {
+            if !is_valid_identifier(owner) || (!filter_owner.is_empty() && filter_owner != owner) {
                 continue;
             }
 
+            let owner_dir = owner_entry.path();
             for visibility in [VISIBILITY_PRIVATE, VISIBILITY_PUBLIC] {
                 if !filter_vis.is_empty() && filter_vis != visibility {
                     continue;
                 }
-
-                // Defense-in-depth visibility check alongside OS directory modes
-                if visibility == VISIBILITY_PRIVATE {
-                    let allowed = match (scope, auth_user) {
-                        (SCOPE_USERS, Some(user)) => user == owner,
-                        (SCOPE_TEAMS, Some(user)) => {
-                            creds.team_names.iter().any(|t| t == owner)
-                                || is_user_in_team_members_file(
-                                    &owner_entry.path().join("members"),
-                                    user,
-                                )
-                        }
-                        _ => false,
-                    };
-                    if !allowed {
-                        continue;
-                    }
-                }
-
-                let vis_dir = owner_entry.path().join(visibility);
-                let Ok(vis_meta) = fs::symlink_metadata(&vis_dir) else {
-                    continue;
-                };
-                if vis_meta.file_type().is_symlink() || !vis_meta.is_dir() {
+                if !can_access_visibility(scope, owner, &owner_dir, visibility, creds) {
                     continue;
                 }
-
-                let Ok(repo_entries) = fs::read_dir(&vis_dir) else {
-                    // PermissionDenied or unreadable directory is silently skipped
-                    continue;
-                };
-
-                for repo_entry in repo_entries.flatten() {
-                    let Ok(repo_ft) = repo_entry.file_type() else {
-                        continue;
-                    };
-                    if repo_ft.is_symlink() || !repo_ft.is_dir() {
-                        continue;
-                    }
-
-                    let repo_os = repo_entry.file_name();
-                    let Some(dir_name) = repo_os.to_str() else {
-                        continue;
-                    };
-                    let Some(repo_name) = dir_name.strip_suffix(".git") else {
-                        continue;
-                    };
-                    if !is_valid_identifier(repo_name) {
-                        continue;
-                    }
-
-                    // Ensure the bare repository directory itself is readable by the worker
-                    if fs::read_dir(repo_entry.path()).is_err() {
-                        continue;
-                    }
-
-                    let canonical_path = format_canonical_path(scope, owner, visibility, repo_name);
-                    if !filter_query.is_empty() {
-                        let owner_repo = format!("{owner}/{repo_name}").to_ascii_lowercase();
-                        let name_lower = repo_name.to_ascii_lowercase();
-                        let path_lower = canonical_path.to_ascii_lowercase();
-                        if !name_lower.contains(&filter_query)
-                            && !owner_repo.contains(&filter_query)
-                            && !path_lower.contains(&filter_query)
-                        {
-                            continue;
-                        }
-                    }
-
-                    let ssh_url =
-                        format_ssh_url(normalized_host, scope, owner, visibility, repo_name);
-                    let clone_command = format_clone_command(
-                        normalized_host,
-                        auth_user,
-                        scope,
-                        owner,
-                        visibility,
-                        repo_name,
-                    );
-
-                    discovered.push(DiscoveredRepository {
-                        scope: scope.to_owned(),
-                        owner: owner.to_owned(),
-                        visibility: visibility.to_owned(),
-                        name: repo_name.to_owned(),
-                        canonical_path,
-                        ssh_url,
-                        clone_command,
-                    });
-                }
+                scan_visibility_dir(
+                    &owner_dir.join(visibility),
+                    scope,
+                    owner,
+                    visibility,
+                    &ctx,
+                    &mut discovered,
+                );
             }
         }
     }
@@ -765,25 +840,10 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
             Err(err) => return encode_worker_error(GrpcCode::Unauthenticated, &err.to_string()),
         }
     } else if !preauth.is_empty() {
-        if !is_valid_identifier(preauth) {
-            return encode_worker_error(
-                GrpcCode::Unauthenticated,
-                "invalid preauthenticated username",
-            );
+        match resolve_or_fallback_dev_credentials(root_dir, None, preauth, 65_534) {
+            Ok(c) => c,
+            Err(err) => return encode_worker_error(GrpcCode::Unauthenticated, &err.to_string()),
         }
-        // Resolve from `<root_dir>/users/<preauth>` if provisioned, or fall back to
-        // current process identity for unprovisioned local development (`RO_GIT_DEV_USER`).
-        resolve_user_credentials(root_dir, None, Some(preauth), 65_534).unwrap_or_else(|_| {
-            // SAFETY: `geteuid` and `getegid` are thread-safe POSIX syscalls with no preconditions.
-            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-            UserCredentials {
-                username: Some(preauth.to_owned()),
-                uid,
-                gid,
-                supplementary_gids: Vec::new(),
-                team_names: Vec::new(),
-            }
-        })
     } else {
         UserCredentials {
             username: None,
@@ -988,10 +1048,18 @@ pub fn dispatch_worker_request(
 
 fn status_from_worker_code(code: u32) -> GrpcStatus<'static> {
     match code {
-        3 => GrpcStatus::invalid_argument("invalid worker request"),
-        7 => GrpcStatus::permission_denied("permission denied"),
-        8 => GrpcStatus::resource_exhausted("worker response buffer exhausted"),
-        16 => GrpcStatus::unauthenticated("unauthenticated or invalid SSH signature token"),
+        c if c == GrpcCode::InvalidArgument as u32 => {
+            GrpcStatus::invalid_argument("invalid worker request")
+        }
+        c if c == GrpcCode::PermissionDenied as u32 => {
+            GrpcStatus::permission_denied("permission denied")
+        }
+        c if c == GrpcCode::ResourceExhausted as u32 => {
+            GrpcStatus::resource_exhausted("worker response buffer exhausted")
+        }
+        c if c == GrpcCode::Unauthenticated as u32 => {
+            GrpcStatus::unauthenticated("unauthenticated or invalid SSH signature token")
+        }
         _ => GrpcStatus::internal("worker execution failed"),
     }
 }
@@ -1046,24 +1114,13 @@ impl GitServiceHandler {
         }
 
         if let Some(ref dev_user) = self.config.dev_user {
-            if !is_valid_identifier(dev_user) {
-                return Err(GrpcStatus::unauthenticated(
-                    "invalid RO_GIT_DEV_USER identifier",
-                ));
-            }
-            let creds =
-                resolve_user_credentials(root_path, None, Some(dev_user), self.config.nobody_uid)
-                    .unwrap_or_else(|_| {
-                        // SAFETY: `geteuid` and `getegid` are thread-safe POSIX syscalls.
-                        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-                        UserCredentials {
-                            username: Some(dev_user.clone()),
-                            uid,
-                            gid,
-                            supplementary_gids: Vec::new(),
-                            team_names: Vec::new(),
-                        }
-                    });
+            let creds = resolve_or_fallback_dev_credentials(
+                root_path,
+                None,
+                dev_user,
+                self.config.nobody_uid,
+            )
+            .map_err(|_| GrpcStatus::unauthenticated("invalid RO_GIT_DEV_USER identifier"))?;
             return Ok((None, Some(dev_user.clone()), creds));
         }
 
@@ -1071,22 +1128,19 @@ impl GitServiceHandler {
             .map_err(|_| GrpcStatus::internal("failed to resolve anonymous credentials"))?;
         Ok((None, None, creds))
     }
-}
 
-impl GitService for GitServiceHandler {
-    fn get_auth_status<'a, 'b>(
+    fn execute_worker_command<'a>(
         &self,
-        meta: &mut RpcMetadata<'_>,
-        _req: GetAuthStatusRequestView<'a>,
-        resp: &mut GetAuthStatusResponseBuilder<'b>,
-    ) -> Result<(), GrpcStatus<'static>> {
+        meta: &RpcMetadata<'a>,
+        write_command: impl FnOnce(&mut WorkerRequestBuilder<'_>),
+    ) -> Result<Vec<u8>, GrpcStatus<'static>> {
         let (token, preauth, creds) = self.resolve_request_auth(meta)?;
         let now_secs = current_unix_secs();
 
         let mut req_buf = [0u8; 4096];
         let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
+        write_command(&mut req_builder);
         req_builder
-            .write_get_auth_status(|_| {})
             .write_now_unix_secs(now_secs)
             .write_max_token_ttl_secs(self.config.max_token_ttl_secs)
             .write_ssh_host(&self.config.ssh_host)
@@ -1105,10 +1159,27 @@ impl GitService for GitServiceHandler {
         let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
             .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
 
-        let status_code = resp_view.status_code().unwrap_or(0);
-        if status_code != 0 {
+        let status_code = resp_view.status_code().unwrap_or(GrpcCode::Ok as u32);
+        if status_code != GrpcCode::Ok as u32 {
             return Err(status_from_worker_code(status_code));
         }
+
+        Ok(resp_bytes)
+    }
+}
+
+impl GitService for GitServiceHandler {
+    fn get_auth_status<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        _req: GetAuthStatusRequestView<'a>,
+        resp: &mut GetAuthStatusResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_get_auth_status(|_| {});
+        })?;
+        let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
+            .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
 
         match resp_view.result() {
             Ok(Some(worker_response::Result::AuthStatus(auth))) => {
@@ -1127,45 +1198,21 @@ impl GitService for GitServiceHandler {
         req: ListRepositoriesRequestView<'a>,
         resp: &mut ListRepositoriesResponseBuilder<'b>,
     ) -> Result<(), GrpcStatus<'static>> {
-        let (token, preauth, creds) = self.resolve_request_auth(meta)?;
-        let now_secs = current_unix_secs();
-
         let scope = req.scope().unwrap_or("");
         let owner = req.owner().unwrap_or("");
         let visibility = req.visibility().unwrap_or("");
         let query = req.query().unwrap_or("");
 
-        let mut req_buf = [0u8; 4096];
-        let mut req_builder = WorkerRequestBuilder::new(&mut req_buf);
-        req_builder
-            .write_list_repositories(|lr| {
+        let resp_bytes = self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_list_repositories(|lr| {
                 lr.write_query(query)
                     .write_visibility(visibility)
                     .write_owner(owner)
                     .write_scope(scope);
-            })
-            .write_now_unix_secs(now_secs)
-            .write_max_token_ttl_secs(self.config.max_token_ttl_secs)
-            .write_ssh_host(&self.config.ssh_host)
-            .write_root_dir(&self.config.root_dir);
-        if let Some(ref dev_user) = preauth {
-            req_builder.write_preauthenticated_user(dev_user);
-        }
-        if let Some(ref tok) = token {
-            req_builder.write_token(tok);
-        }
-        let req_bytes = req_builder
-            .finish()
-            .map_err(|_| GrpcStatus::resource_exhausted("worker request buffer exhausted"))?;
-
-        let resp_bytes = dispatch_worker_request(&creds, req_bytes)?;
+            });
+        })?;
         let resp_view = WorkerResponseView::from_bytes(&resp_bytes)
             .map_err(|_| GrpcStatus::internal("invalid WorkerResponse from git-worker"))?;
-
-        let status_code = resp_view.status_code().unwrap_or(0);
-        if status_code != 0 {
-            return Err(status_from_worker_code(status_code));
-        }
 
         match resp_view.result() {
             Ok(Some(worker_response::Result::ListRepositories(list_view))) => {
