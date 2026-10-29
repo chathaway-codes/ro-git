@@ -1,8 +1,14 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod markdown;
 
 pub use app::App;
+pub use markdown::{
+    is_safe_markdown_url, markdown_options, normalize_repo_path, render_markdown,
+    render_vnode_to_html_string, resolve_markdown_url, MarkdownContext, MarkdownProps,
+    MarkdownView,
+};
 
 use ro_git_proto::ro_git::v1::{GetAuthStatusResponseView, ListRepositoriesResponseView};
 use ro_git_proto::{
