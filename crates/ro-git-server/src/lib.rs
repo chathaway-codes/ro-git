@@ -1347,6 +1347,56 @@ pub fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+fn is_safe_asset_path(path: &str) -> bool {
+    !path.contains('\\')
+        && !path.contains('\0')
+        && !path.split('/').any(|seg| seg == ".." || seg == ".")
+}
+
+fn read_regular_asset(
+    path: &Path,
+    content_type: &'static str,
+) -> Result<Option<StaticAssetResponse>, StaticAssetResponse> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if meta.file_type().is_symlink() {
+        return Err(StaticAssetResponse::forbidden());
+    }
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read(path).map_err(|_| StaticAssetResponse::not_found())?;
+    Ok(Some(StaticAssetResponse {
+        status_code: 200,
+        content_type,
+        body,
+    }))
+}
+
+fn resolve_candidate_asset(
+    static_dir: &Path,
+    decoded_path: &str,
+) -> Result<Option<StaticAssetResponse>, StaticAssetResponse> {
+    let mut candidate = static_dir.to_path_buf();
+    let mut has_segments = false;
+    for seg in decoded_path.split('/').filter(|s| !s.is_empty()) {
+        has_segments = true;
+        candidate.push(seg);
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(StaticAssetResponse::forbidden());
+            }
+            Ok(_) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    if !has_segments {
+        return Ok(None);
+    }
+    read_regular_asset(&candidate, content_type_for_path(&candidate))
+}
+
 /// Resolves and reads a static asset from `static_dir` for `request_path`, rejecting
 /// path traversal (`..`), backslashes, NUL bytes, and symlinks, and falling back to
 /// `<static_dir>/index.html` for unknown non-API SPA routes.
@@ -1356,97 +1406,35 @@ pub fn serve_static_asset(static_dir: &Path, request_path: &str) -> StaticAssetR
     if raw_path == "/api" || raw_path.starts_with("/api/") {
         return StaticAssetResponse::not_found();
     }
-    if raw_path.contains('\\') || raw_path.contains('\0') {
+    if !is_safe_asset_path(raw_path) {
         return StaticAssetResponse::forbidden();
-    }
-    for seg in raw_path.split('/') {
-        if seg == ".." || seg == "." {
-            return StaticAssetResponse::forbidden();
-        }
     }
 
     let mut decode_buf = vec![0u8; raw_path.len().max(1)];
     let Ok(decoded_path) = percent_decode_str(raw_path, &mut decode_buf) else {
         return StaticAssetResponse::forbidden();
     };
-    if decoded_path.contains('\\') || decoded_path.contains('\0') {
+    if !is_safe_asset_path(decoded_path) {
         return StaticAssetResponse::forbidden();
-    }
-    for seg in decoded_path.split('/') {
-        if seg == ".." || seg == "." {
-            return StaticAssetResponse::forbidden();
-        }
     }
 
     match fs::symlink_metadata(static_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return StaticAssetResponse::forbidden();
-            }
-            if !meta.is_dir() {
-                return StaticAssetResponse::not_found();
-            }
-        }
-        Err(_) => return StaticAssetResponse::not_found(),
+        Ok(meta) if meta.file_type().is_symlink() => return StaticAssetResponse::forbidden(),
+        Ok(meta) if meta.is_dir() => {}
+        _ => return StaticAssetResponse::not_found(),
     }
 
-    let segments: Vec<&str> = decoded_path.split('/').filter(|s| !s.is_empty()).collect();
-    if !segments.is_empty() {
-        let mut candidate = static_dir.to_path_buf();
-        let mut all_exist = true;
-        for seg in segments {
-            candidate.push(seg);
-            match fs::symlink_metadata(&candidate) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return StaticAssetResponse::forbidden();
-                    }
-                }
-                Err(_) => {
-                    all_exist = false;
-                    break;
-                }
-            }
-        }
-
-        if all_exist {
-            if let Ok(meta) = fs::symlink_metadata(&candidate) {
-                if meta.file_type().is_symlink() {
-                    return StaticAssetResponse::forbidden();
-                }
-                if meta.is_file() {
-                    return match fs::read(&candidate) {
-                        Ok(body) => StaticAssetResponse {
-                            status_code: 200,
-                            content_type: content_type_for_path(&candidate),
-                            body,
-                        },
-                        Err(_) => StaticAssetResponse::not_found(),
-                    };
-                }
-            }
-        }
+    match resolve_candidate_asset(static_dir, decoded_path) {
+        Ok(Some(resp)) => return resp,
+        Err(err_resp) => return err_resp,
+        Ok(None) => {}
     }
 
     let index_path = static_dir.join("index.html");
-    match fs::symlink_metadata(&index_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                StaticAssetResponse::forbidden()
-            } else if meta.is_file() {
-                match fs::read(&index_path) {
-                    Ok(body) => StaticAssetResponse {
-                        status_code: 200,
-                        content_type: "text/html; charset=utf-8",
-                        body,
-                    },
-                    Err(_) => StaticAssetResponse::not_found(),
-                }
-            } else {
-                StaticAssetResponse::not_found()
-            }
-        }
-        Err(_) => StaticAssetResponse::not_found(),
+    match read_regular_asset(&index_path, "text/html; charset=utf-8") {
+        Ok(Some(resp)) => resp,
+        Ok(None) => StaticAssetResponse::not_found(),
+        Err(err_resp) => err_resp,
     }
 }
 
@@ -1623,6 +1611,32 @@ struct ParsedH1Request {
     connection_close: bool,
 }
 
+struct H1Response {
+    status_code: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    omit_body: bool,
+}
+
+impl H1Response {
+    fn plain_error(status_code: u16, message: &str, omit_body: bool) -> Self {
+        Self {
+            status_code,
+            content_type: "text/plain; charset=utf-8",
+            body: message.as_bytes().to_vec(),
+            omit_body,
+        }
+    }
+
+    fn from_grpc_status(status: GrpcStatus<'_>, omit_body: bool) -> Self {
+        Self::plain_error(
+            http_status_from_grpc_code(status.code),
+            status.message,
+            omit_body,
+        )
+    }
+}
+
 fn parse_h1_headers(header_bytes: &[u8]) -> Option<(ParsedH1Request, usize)> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
     let mut lines = header_str.split("\r\n");
@@ -1703,178 +1717,149 @@ fn wants_json(accept: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> (u16, &'static str, Vec<u8>, bool) {
+fn handle_h1_auth_status(
+    handler: &GitServiceHandler,
+    req: &ParsedH1Request,
+    omit_body: bool,
+) -> H1Response {
+    let Ok(req_view) = GetAuthStatusRequestView::from_bytes(&[]) else {
+        return H1Response::plain_error(500, "internal error", omit_body);
+    };
+    let mut ctx = build_rpc_context(req);
+    let mut meta = ctx.metadata();
+    let mut buf = vec![0u8; 4096];
+    let mut builder = GetAuthStatusResponseBuilder::new(&mut buf);
+    if let Err(status) = handler.get_auth_status(&mut meta, req_view, &mut builder) {
+        return H1Response::from_grpc_status(status, omit_body);
+    }
+    let Ok(proto_bytes) = builder.finish() else {
+        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
+    };
+    if wants_json(req.accept.as_deref()) {
+        if let Ok(view) = GetAuthStatusResponseView::from_bytes(proto_bytes) {
+            return H1Response {
+                status_code: 200,
+                content_type: "application/json; charset=utf-8",
+                body: encode_auth_status_json(view),
+                omit_body,
+            };
+        }
+    }
+    H1Response {
+        status_code: 200,
+        content_type: "application/x-protobuf",
+        body: proto_bytes.to_vec(),
+        omit_body,
+    }
+}
+
+fn handle_h1_list_repositories(
+    handler: &GitServiceHandler,
+    req: &ParsedH1Request,
+    omit_body: bool,
+) -> H1Response {
+    let mut raw_scope = "";
+    let mut raw_owner = "";
+    let mut raw_vis = "";
+    let mut raw_query = "";
+
+    for (k, v) in QueryIter::new(&req.query) {
+        match k {
+            "scope" => raw_scope = v,
+            "owner" => raw_owner = v,
+            "visibility" => raw_vis = v,
+            "query" => raw_query = v,
+            _ => {}
+        }
+    }
+
+    let mut scope_buf = [0u8; 128];
+    let mut owner_buf = [0u8; 128];
+    let mut vis_buf = [0u8; 128];
+    let mut query_buf = [0u8; 512];
+    let scope_val = percent_decode_str(raw_scope, &mut scope_buf).unwrap_or("");
+    let owner_val = percent_decode_str(raw_owner, &mut owner_buf).unwrap_or("");
+    let vis_val = percent_decode_str(raw_vis, &mut vis_buf).unwrap_or("");
+    let query_val = percent_decode_str(raw_query, &mut query_buf).unwrap_or("");
+
+    let mut req_buf = [0u8; 1024];
+    let mut req_builder = ListRepositoriesRequestBuilder::new(&mut req_buf);
+    req_builder
+        .write_query(query_val)
+        .write_visibility(vis_val)
+        .write_owner(owner_val)
+        .write_scope(scope_val);
+    let Ok(req_bytes) = req_builder.finish() else {
+        return H1Response::plain_error(400, "query parameters too large", omit_body);
+    };
+    let Ok(req_view) = ListRepositoriesRequestView::from_bytes(req_bytes) else {
+        return H1Response::plain_error(400, "invalid request", omit_body);
+    };
+
+    let mut ctx = build_rpc_context(req);
+    let mut meta = ctx.metadata();
+    let mut resp_buf = vec![0u8; 65_536];
+    let mut resp_builder = ListRepositoriesResponseBuilder::new(&mut resp_buf);
+    if let Err(status) = handler.list_repositories(&mut meta, req_view, &mut resp_builder) {
+        return H1Response::from_grpc_status(status, omit_body);
+    }
+    let Ok(proto_bytes) = resp_builder.finish() else {
+        return H1Response::plain_error(500, "response buffer exhausted", omit_body);
+    };
+    if wants_json(req.accept.as_deref()) {
+        if let Ok(view) = ListRepositoriesResponseView::from_bytes(proto_bytes) {
+            return H1Response {
+                status_code: 200,
+                content_type: "application/json; charset=utf-8",
+                body: encode_list_repositories_json(view),
+                omit_body,
+            };
+        }
+    }
+    H1Response {
+        status_code: 200,
+        content_type: "application/x-protobuf",
+        body: proto_bytes.to_vec(),
+        omit_body,
+    }
+}
+
+fn dispatch_h1_request(handler: &GitServiceHandler, req: &ParsedH1Request) -> H1Response {
     let is_head = req.method.eq_ignore_ascii_case("HEAD");
     let is_get = req.method.eq_ignore_ascii_case("GET");
 
+    if (req.path == "/api" || req.path.starts_with("/api/"))
+        && req.path != API_AUTH_STATUS_PATH
+        && req.path != API_REPOSITORIES_PATH
+    {
+        return H1Response::plain_error(404, "not found", is_head);
+    }
+    if !is_get && !is_head {
+        return H1Response::plain_error(405, "method not allowed", false);
+    }
+
     if req.path == API_AUTH_STATUS_PATH {
-        if !is_get && !is_head {
-            return (
-                405,
-                "text/plain; charset=utf-8",
-                b"method not allowed".to_vec(),
-                false,
-            );
-        }
-        let Ok(req_view) = GetAuthStatusRequestView::from_bytes(&[]) else {
-            return (
-                500,
-                "text/plain; charset=utf-8",
-                b"internal error".to_vec(),
-                is_head,
-            );
-        };
-        let mut ctx = build_rpc_context(req);
-        let mut meta = ctx.metadata();
-        let mut buf = vec![0u8; 4096];
-        let mut builder = GetAuthStatusResponseBuilder::new(&mut buf);
-        match handler.get_auth_status(&mut meta, req_view, &mut builder) {
-            Ok(()) => match builder.finish() {
-                Ok(proto_bytes) => {
-                    if wants_json(req.accept.as_deref()) {
-                        if let Ok(view) = GetAuthStatusResponseView::from_bytes(proto_bytes) {
-                            return (
-                                200,
-                                "application/json; charset=utf-8",
-                                encode_auth_status_json(view),
-                                is_head,
-                            );
-                        }
-                    }
-                    (200, "application/x-protobuf", proto_bytes.to_vec(), is_head)
-                }
-                Err(_) => (
-                    500,
-                    "text/plain; charset=utf-8",
-                    b"response buffer exhausted".to_vec(),
-                    is_head,
-                ),
-            },
-            Err(status) => (
-                http_status_from_grpc_code(status.code),
-                "text/plain; charset=utf-8",
-                status.message.as_bytes().to_vec(),
-                is_head,
-            ),
-        }
+        handle_h1_auth_status(handler, req, is_head)
     } else if req.path == API_REPOSITORIES_PATH {
-        if !is_get && !is_head {
-            return (
-                405,
-                "text/plain; charset=utf-8",
-                b"method not allowed".to_vec(),
-                false,
-            );
-        }
-        let mut raw_scope = "";
-        let mut raw_owner = "";
-        let mut raw_vis = "";
-        let mut raw_query = "";
-
-        for (k, v) in QueryIter::new(&req.query) {
-            match k {
-                "scope" => raw_scope = v,
-                "owner" => raw_owner = v,
-                "visibility" => raw_vis = v,
-                "query" => raw_query = v,
-                _ => {}
-            }
-        }
-
-        let mut scope_buf = [0u8; 128];
-        let mut owner_buf = [0u8; 128];
-        let mut vis_buf = [0u8; 128];
-        let mut query_buf = [0u8; 512];
-        let scope_val = percent_decode_str(raw_scope, &mut scope_buf).unwrap_or("");
-        let owner_val = percent_decode_str(raw_owner, &mut owner_buf).unwrap_or("");
-        let vis_val = percent_decode_str(raw_vis, &mut vis_buf).unwrap_or("");
-        let query_val = percent_decode_str(raw_query, &mut query_buf).unwrap_or("");
-
-        let mut req_buf = [0u8; 1024];
-        let mut req_builder = ListRepositoriesRequestBuilder::new(&mut req_buf);
-        req_builder
-            .write_query(query_val)
-            .write_visibility(vis_val)
-            .write_owner(owner_val)
-            .write_scope(scope_val);
-        let Ok(req_bytes) = req_builder.finish() else {
-            return (
-                400,
-                "text/plain; charset=utf-8",
-                b"query parameters too large".to_vec(),
-                is_head,
-            );
-        };
-        let Ok(req_view) = ListRepositoriesRequestView::from_bytes(req_bytes) else {
-            return (
-                400,
-                "text/plain; charset=utf-8",
-                b"invalid request".to_vec(),
-                is_head,
-            );
-        };
-
-        let mut ctx = build_rpc_context(req);
-        let mut meta = ctx.metadata();
-        let mut resp_buf = vec![0u8; 65_536];
-        let mut resp_builder = ListRepositoriesResponseBuilder::new(&mut resp_buf);
-        match handler.list_repositories(&mut meta, req_view, &mut resp_builder) {
-            Ok(()) => match resp_builder.finish() {
-                Ok(proto_bytes) => {
-                    if wants_json(req.accept.as_deref()) {
-                        if let Ok(view) = ListRepositoriesResponseView::from_bytes(proto_bytes) {
-                            return (
-                                200,
-                                "application/json; charset=utf-8",
-                                encode_list_repositories_json(view),
-                                is_head,
-                            );
-                        }
-                    }
-                    (200, "application/x-protobuf", proto_bytes.to_vec(), is_head)
-                }
-                Err(_) => (
-                    500,
-                    "text/plain; charset=utf-8",
-                    b"response buffer exhausted".to_vec(),
-                    is_head,
-                ),
-            },
-            Err(status) => (
-                http_status_from_grpc_code(status.code),
-                "text/plain; charset=utf-8",
-                status.message.as_bytes().to_vec(),
-                is_head,
-            ),
-        }
-    } else if req.path == "/api" || req.path.starts_with("/api/") {
-        (
-            404,
-            "text/plain; charset=utf-8",
-            b"not found".to_vec(),
-            is_head,
-        )
-    } else if !is_get && !is_head {
-        (
-            405,
-            "text/plain; charset=utf-8",
-            b"method not allowed".to_vec(),
-            false,
-        )
+        handle_h1_list_repositories(handler, req, is_head)
     } else {
         let asset = serve_static_asset(Path::new(&handler.config.static_dir), &req.path);
-        (asset.status_code, asset.content_type, asset.body, is_head)
+        H1Response {
+            status_code: asset.status_code,
+            content_type: asset.content_type,
+            body: asset.body,
+            omit_body: is_head,
+        }
     }
 }
 
 fn write_h1_response<W: Write>(
     stream: &mut W,
-    status_code: u16,
-    content_type: &str,
-    body: &[u8],
-    is_head: bool,
+    resp: &H1Response,
     connection_close: bool,
 ) -> io::Result<()> {
+    let status_code = resp.status_code;
+    let content_type = resp.content_type;
     let reason = http_reason_phrase(status_code);
     let conn_hdr = if connection_close {
         "close"
@@ -1883,11 +1868,11 @@ fn write_h1_response<W: Write>(
     };
     let header = format!(
         "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {conn_hdr}\r\n\r\n",
-        body.len()
+        resp.body.len()
     );
     stream.write_all(header.as_bytes())?;
-    if !is_head {
-        stream.write_all(body)?;
+    if !resp.omit_body {
+        stream.write_all(&resp.body)?;
     }
     stream.flush()
 }
@@ -1955,14 +1940,8 @@ fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::
                 break end;
             }
             if buf.len() >= MAX_HEADER_BYTES {
-                let _ = write_h1_response(
-                    &mut io,
-                    400,
-                    "text/plain; charset=utf-8",
-                    b"request headers too large",
-                    false,
-                    true,
-                );
+                let err_resp = H1Response::plain_error(400, "request headers too large", false);
+                let _ = write_h1_response(&mut io, &err_resp, true);
                 return Ok(());
             }
             let n = read_chunk_uninterrupted(&mut io, &mut scratch)?;
@@ -1973,26 +1952,14 @@ fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::
         };
 
         let Some((parsed_req, content_length)) = parse_h1_headers(&buf[..header_end]) else {
-            let _ = write_h1_response(
-                &mut io,
-                400,
-                "text/plain; charset=utf-8",
-                b"bad request",
-                false,
-                true,
-            );
+            let err_resp = H1Response::plain_error(400, "bad request", false);
+            let _ = write_h1_response(&mut io, &err_resp, true);
             return Ok(());
         };
 
         if content_length > MAX_BODY_BYTES {
-            let _ = write_h1_response(
-                &mut io,
-                413,
-                "text/plain; charset=utf-8",
-                b"payload too large",
-                false,
-                true,
-            );
+            let err_resp = H1Response::plain_error(413, "payload too large", false);
+            let _ = write_h1_response(&mut io, &err_resp, true);
             return Ok(());
         }
 
@@ -2007,15 +1974,8 @@ fn serve_h1_connection<S: Read + Write>(mut io: S, config: ServerConfig) -> io::
 
         buf.drain(..total_req_len);
 
-        let (status_code, content_type, body, is_head) = dispatch_h1_request(&handler, &parsed_req);
-        write_h1_response(
-            &mut io,
-            status_code,
-            content_type,
-            &body,
-            is_head,
-            parsed_req.connection_close,
-        )?;
+        let resp = dispatch_h1_request(&handler, &parsed_req);
+        write_h1_response(&mut io, &resp, parsed_req.connection_close)?;
 
         if parsed_req.connection_close {
             return Ok(());
