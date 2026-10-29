@@ -142,21 +142,115 @@ flowchart LR
 
 ---
 
-## 4. Configuration (Environment Variables)
+## 4. Configuration, Environment Variables & CLI Arguments
 
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `RO_GIT_LISTEN_ADDR` | `0.0.0.0:8080` | TCP address for the unified `roto-grpc` (gRPC + HTTP/1.1 + HTTP/2) server. |
-| `RO_GIT_ROOT` | `/` | Root prefix containing `users/` and `teams/` directories (e.g., `/` in container, or a temp dir in tests). |
-| `RO_GIT_SSH_HOST` | `localhost` | Public SSH hostname (and optional `:port`) used when formatting `ssh://` and `git clone` URLs in the UI. |
-| `RO_GIT_STATIC_DIR` | `/app/dist` | Path to compiled Yew WASM frontend assets (`index.html`, `.wasm`, `.js`). |
-| `RO_GIT_MAX_TOKEN_TTL_SECS` | `2592000` | Maximum allowed token lifetime in seconds (default: 30 days). |
-| `RO_GIT_NOBODY_UID` | `65534` | Unprivileged UID/GID used by the worker subprocess for anonymous requests. |
-| `RO_GIT_DEV_USER` | *(unset)* | Optional fallback username for local development when no `Authorization` header is present. |
+### Environment Variables
+
+| Variable | Default | Component | Description |
+| :--- | :--- | :--- | :--- |
+| `RO_GIT_LISTEN_ADDR` | `0.0.0.0:8080` | `ro-git-server` | TCP socket address for the unified `roto-grpc` (gRPC + HTTP/1.1 + HTTP/2) server. |
+| `RO_GIT_ROOT` | `/` | `ro-git-server`, `git-auto-shell`, `git-sync-users` | Root prefix containing `users/` and `teams/` directories (e.g., `/` in container, or a temp dir in tests). |
+| `RO_GIT_SSH_HOST` | `localhost` | `ro-git-server` | Public SSH hostname (and optional `:port`, e.g., `git.example.com:2222`) used when formatting `ssh://` and `git clone` URLs in the UI. |
+| `RO_GIT_STATIC_DIR` | `/app/dist` | `ro-git-server` | Path to compiled Yew WASM frontend assets (`index.html`, `.wasm`, `.js`). |
+| `RO_GIT_MAX_TOKEN_TTL_SECS` | `2592000` | `ro-git-server` | Maximum allowed SSH bearer token lifetime in seconds (default: 30 days). |
+| `RO_GIT_NOBODY_UID` | `65534` | `ro-git-server` | Unprivileged UID/GID used by the worker subprocess for anonymous requests. |
+| `RO_GIT_DEV_USER` | *(unset)* | `ro-git-server` | Optional fallback username for local development when no `Authorization` header is present. |
+| `RO_GIT_ETC_DIR` | `<RO_GIT_ROOT>/etc` (or `/etc`) | `ro-git-server`, `git-sync-users` | Directory containing `passwd` and `group` files used for UID/GID and team membership resolution. |
+| `RO_GIT_WORKER_BIN` | *(auto-detected)* | `ro-git-server` | Optional explicit path to the `ro-git-server` binary invoked when spawning `git-worker` subprocesses. |
+| `GIT_SYNC_USERS_BIN` | `/usr/local/bin/git-sync-users` | `docker-entrypoint.sh` | Path to the `git-sync-users` executable run at container startup. |
+| `SSH_KEYGEN_BIN` | `/usr/bin/ssh-keygen` | `docker-entrypoint.sh` | Path to `ssh-keygen` used to generate missing SSH host keys (`-A`) at startup. |
+| `SSHD_BIN` | `/usr/sbin/sshd` | `docker-entrypoint.sh` | Path to the OpenSSH daemon executable launched at startup. |
+| `RO_GIT_SERVER_BIN` | `/usr/local/bin/ro-git-server` | `docker-entrypoint.sh` | Path to the `ro-git-server` binary `exec`'d as PID 1 when no custom command is passed. |
+| `GIT_SHELL_BIN` | `/usr/bin/git-shell` | `git-auto-shell` | Path to the underlying `git-shell` binary delegated to by `git-auto-shell`. |
+
+### Command-Line Arguments & Entrypoint Behavior
+
+- **`/usr/local/bin/docker-entrypoint.sh [command [args...]]`** (Container `ENTRYPOINT`):
+  1. Executes `git-sync-users` (`>&2`) to reconcile `/users` and `/teams` into `/etc/passwd` and `/etc/group` and enforce filesystem ownership and permission invariants.
+  2. Executes `ssh-keygen -A` (`>&2`) to generate any missing OpenSSH host keys under `/etc/ssh`.
+  3. **Default (no arguments)**: Starts `/usr/sbin/sshd -e` (`>&2`) in the background and `exec`s `/usr/local/bin/ro-git-server` in the foreground.
+  4. **Custom command (`command [args...]`)**: After running reconciliation and host-key generation, replaces the process with `exec "$@"` (useful for one-off maintenance or inspection).
+- **`/usr/local/bin/ro-git-server [git-worker]`**:
+  - **No arguments**: Starts the HTTP/1.1 + HTTP/2 + `roto-grpc` server configured via `RO_GIT_*` environment variables.
+  - **`git-worker`**: Runs as a privilege-separated single-request worker subprocess (reads one length-prefixed Protobuf `WorkerRequest` from `stdin` and writes one length-prefixed `WorkerResponse` to `stdout`).
+- **`/usr/local/bin/git-sync-users [--root <PATH>] [--etc-dir <PATH>]`**:
+  - `--root <PATH>`: Root directory containing `users/` and `teams/` (overrides `RO_GIT_ROOT`, defaults to `/`).
+  - `--etc-dir <PATH>`: Directory containing `passwd` and `group` (overrides `RO_GIT_ETC_DIR`, defaults to `<root>/etc`).
+
+### Configuration Files
+
+- **`/etc/ssh/sshd_config`** (baked into the image from `config/sshd_config`, mode `0644`):
+  Enforces SSH public-key authentication from `/users/%u/authorized_keys`, disables passwords/PAM/root login, and requires `StrictModes yes`.
 
 ---
 
-## Development & Workspace Commands
+## 5. Running the Production Docker Image & Persistent Volumes
+
+### Building the Production Image
+
+The multi-stage `Dockerfile` includes a minimal `production` target (`debian:bookworm-slim` with `openssh-server`, `git`, `python3`, `git-auto-shell`, `git-sync-users`, `ro-git-server`, and compiled Yew WASM static assets in `/app/dist`):
+
+```bash
+# Build production image (ro-git:latest)
+make docker-prod
+# Or directly with Docker:
+docker build --target production -t ro-git:latest .
+```
+
+### Expected Persistent Volumes / Disks
+
+Because `ro-git` is completely database-free, all state lives directly on the filesystem. Mount POSIX-compliant persistent volumes or host disks (supporting `chown`, `chmod`, and `setgid` bits) at the following container paths:
+
+| Container Mount Path | Requirement | Purpose & Contents |
+| :--- | :--- | :--- |
+| `/users` | **Required** | Stores per-user directories (`/users/<user>`), SSH public keys (`/users/<user>/authorized_keys`), and bare user Git repositories (`/users/<user>/public/<repo>.git` and `/users/<user>/private/<repo>.git`). Must support POSIX ownership and `0755` / `0700` / `0600` modes for OpenSSH `StrictModes`. |
+| `/teams` | **Required** *(if using teams)* | Stores per-team directories (`/teams/<team>`), team membership lists (`/teams/<team>/members`), and shared bare team Git repositories (`/teams/<team>/public/<repo>.git` and `/teams/<team>/private/<repo>.git`). Must support POSIX group ownership and `setgid` modes (`2775` / `2770`). |
+| `/etc/ssh` | **Recommended** | Persists OpenSSH server host keys (`/etc/ssh/ssh_host_*_key*` generated by `ssh-keygen -A`) across container recreations so Git SSH clients do not fail with `REMOTE HOST IDENTIFICATION HAS CHANGED`. *(Note: When using a named Docker volume on `/etc/ssh`, Docker automatically initializes it with the image's `/etc/ssh/sshd_config`; if bind-mounting an empty host directory over `/etc/ssh`, copy `config/sshd_config` to `/etc/ssh/sshd_config` first or bind-mount only the `ssh_host_*` key files.)* |
+
+### Running the Container
+
+```bash
+# 1. Create named persistent volumes for user repos, team repos, and SSH host keys
+docker volume create ro-git-users
+docker volume create ro-git-teams
+docker volume create ro-git-ssh
+
+# 2. Run the production container (publishing SSH on 2222 and Web UI / gRPC on 8080)
+docker run -d \
+  --name ro-git \
+  --restart unless-stopped \
+  -p 2222:22 \
+  -p 8080:8080 \
+  -e RO_GIT_LISTEN_ADDR=0.0.0.0:8080 \
+  -e RO_GIT_SSH_HOST=localhost:2222 \
+  -e RO_GIT_MAX_TOKEN_TTL_SECS=2592000 \
+  -v ro-git-users:/users \
+  -v ro-git-teams:/teams \
+  -v ro-git-ssh:/etc/ssh \
+  ro-git:latest
+```
+
+### Provisioning Users & Teams on Persistent Volumes
+
+Whenever you add or modify `/users/<user>/authorized_keys` or `/teams/<team>/members` on a running container, run `git-sync-users` (or restart the container) to reconcile `/etc/passwd`, `/etc/group`, and directory permissions:
+
+```bash
+# Provision a user ("alice") and a team ("core") inside the persistent volumes
+docker exec ro-git sh -c '
+  mkdir -p /users/alice /teams/core &&
+  printf "%s\n" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@example.com" > /users/alice/authorized_keys &&
+  printf "%s\n" "alice" > /teams/core/members &&
+  /usr/local/bin/git-sync-users
+'
+
+# Push a new repository (created on the fly by git-auto-shell on first push)
+git push ssh://alice@localhost:2222/users/alice/public/hello.git main
+git push ssh://alice@localhost:2222/teams/core/private/secret.git main
+```
+
+---
+
+## 6. Development & Workspace Commands
 
 All development dependencies—including the Rust stable toolchain, `wasm32-unknown-unknown` target, `protoc`, `cargo-roto`, `protoc-gen-roto`, `protoc-gen-roto-grpc`, `trunk`, `wasm-bindgen`, and `binaryen`—are pre-installed in the development `Dockerfile`.
 
@@ -164,6 +258,9 @@ All development dependencies—including the Rust stable toolchain, `wasm32-unkn
 ```bash
 # Build the development Docker image (ro-git-workspace:latest)
 make docker-build
+
+# Build the production Docker image (ro-git:latest)
+make docker-prod
 
 # Launch an interactive shell inside the container
 make docker-shell
