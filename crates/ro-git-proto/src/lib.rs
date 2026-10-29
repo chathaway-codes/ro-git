@@ -3,8 +3,11 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 #[rustfmt::skip]
 pub mod generated;
@@ -23,6 +26,60 @@ pub const SCOPE_TEAMS: &str = "teams";
 /// Valid repository visibility tiers (`public` and `private`).
 pub const VISIBILITY_PUBLIC: &str = "public";
 pub const VISIBILITY_PRIVATE: &str = "private";
+
+/// OpenSSH `SSHSIG` signature namespace used for stateless web tokens.
+pub const SSH_SIG_NAMESPACE: &str = "ro-git";
+
+/// Token payload version prefix (`ro-git:v1:<user>:<exp_unix>`).
+pub const TOKEN_VERSION_PREFIX: &str = "ro-git:v1";
+
+/// OpenSSH `SSHSIG` PEM header and footer markers.
+pub const SSH_SIG_PEM_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+pub const SSH_SIG_PEM_END: &str = "-----END SSH SIGNATURE-----";
+
+const BASE64URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Decoded stateless bearer token components.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedToken {
+    pub payload: String,
+    pub sshsig_pem: String,
+    pub username: String,
+    pub exp_unix_secs: u64,
+}
+
+/// Errors produced when formatting, encoding, decoding, or validating a stateless bearer token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenError {
+    MalformedToken,
+    InvalidBase64,
+    InvalidUtf8,
+    InvalidPayloadFormat,
+    InvalidVersionPrefix,
+    InvalidUsername,
+    InvalidExpiration,
+    InvalidSignaturePem,
+    TokenExpired,
+    TokenTtlExceeded,
+}
+
+impl fmt::Display for TokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedToken => f.write_str("malformed bearer token"),
+            Self::InvalidBase64 => f.write_str("invalid base64url encoding"),
+            Self::InvalidUtf8 => f.write_str("invalid UTF-8 in token component"),
+            Self::InvalidPayloadFormat => f.write_str("invalid token payload format"),
+            Self::InvalidVersionPrefix => f.write_str("invalid token version prefix"),
+            Self::InvalidUsername => f.write_str("invalid username in token payload"),
+            Self::InvalidExpiration => f.write_str("invalid expiration timestamp in token payload"),
+            Self::InvalidSignaturePem => f.write_str("invalid OpenSSH signature PEM block"),
+            Self::TokenExpired => f.write_str("token has expired"),
+            Self::TokenTtlExceeded => f.write_str("token expiration exceeds maximum allowed TTL"),
+        }
+    }
+}
 
 /// Returns `true` if `scope` is `"users"` or `"teams"`.
 #[inline]
@@ -127,6 +184,223 @@ pub fn format_clone_command(
     let url =
         format_authenticated_ssh_url(ssh_host, authenticated_user, scope, owner, visibility, name);
     format!("git clone {url}")
+}
+
+/// Formats the canonical token payload `"ro-git:v1:<user>:<exp_unix>"` if `username`
+/// is a valid identifier (`^[a-zA-Z0-9_-]+$`).
+#[must_use]
+pub fn format_token_payload(username: &str, exp_unix_secs: u64) -> Option<String> {
+    if !is_valid_identifier(username) {
+        return None;
+    }
+    Some(format!("{TOKEN_VERSION_PREFIX}:{username}:{exp_unix_secs}"))
+}
+
+/// Parses a canonical token payload `"ro-git:v1:<user>:<exp_unix>"` into `(username, exp_unix_secs)`.
+pub fn parse_token_payload(payload: &str) -> Result<(&str, u64), TokenError> {
+    let rest = payload
+        .strip_prefix(TOKEN_VERSION_PREFIX)
+        .ok_or(TokenError::InvalidVersionPrefix)?;
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or(TokenError::InvalidPayloadFormat)?;
+    let (username, exp_str) = rest
+        .split_once(':')
+        .ok_or(TokenError::InvalidPayloadFormat)?;
+    if exp_str.contains(':') {
+        return Err(TokenError::InvalidPayloadFormat);
+    }
+    if !is_valid_identifier(username) {
+        return Err(TokenError::InvalidUsername);
+    }
+    if exp_str.is_empty() || !exp_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(TokenError::InvalidExpiration);
+    }
+    let exp_unix_secs = exp_str
+        .parse::<u64>()
+        .map_err(|_| TokenError::InvalidExpiration)?;
+    Ok((username, exp_unix_secs))
+}
+
+/// Formats the local `ssh-keygen -Y sign` command for signing a stateless token payload:
+/// `printf 'ro-git:v1:<user>:<exp_unix>' | ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n ro-git`
+#[must_use]
+pub fn format_ssh_keygen_sign_command(username: &str, exp_unix_secs: u64) -> Option<String> {
+    let payload = format_token_payload(username, exp_unix_secs)?;
+    Some(format!(
+        "printf '{payload}' | ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n {SSH_SIG_NAMESPACE}"
+    ))
+}
+
+/// Validates and trims an OpenSSH `SSHSIG` PEM block (`-----BEGIN SSH SIGNATURE-----` ... `-----END SSH SIGNATURE-----`).
+fn validate_and_trim_sshsig_pem(sshsig_pem: &str) -> Result<&str, TokenError> {
+    let trimmed = sshsig_pem.trim();
+    let inner = trimmed
+        .strip_prefix(SSH_SIG_PEM_BEGIN)
+        .and_then(|s| s.strip_suffix(SSH_SIG_PEM_END))
+        .ok_or(TokenError::InvalidSignaturePem)?;
+    if inner.trim().is_empty() {
+        return Err(TokenError::InvalidSignaturePem);
+    }
+    Ok(trimmed)
+}
+
+/// Encodes `input` as URL-safe Base64 without `=` padding (RFC 4648 §5).
+#[must_use]
+pub fn base64url_encode(input: &[u8]) -> String {
+    let mut out = Vec::with_capacity((input.len() * 4).div_ceil(3));
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
+        out.push(BASE64URL_ALPHABET[(b0 >> 2) as usize]);
+        out.push(BASE64URL_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        out.push(BASE64URL_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]);
+        out.push(BASE64URL_ALPHABET[(b2 & 0x3f) as usize]);
+    }
+    if rem.len() == 1 {
+        let b0 = rem[0];
+        out.push(BASE64URL_ALPHABET[(b0 >> 2) as usize]);
+        out.push(BASE64URL_ALPHABET[((b0 & 0x03) << 4) as usize]);
+    } else if rem.len() == 2 {
+        let b0 = rem[0];
+        let b1 = rem[1];
+        out.push(BASE64URL_ALPHABET[(b0 >> 2) as usize]);
+        out.push(BASE64URL_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        out.push(BASE64URL_ALPHABET[((b1 & 0x0f) << 2) as usize]);
+    }
+    String::from_utf8(out).expect("base64url alphabet is valid ASCII")
+}
+
+#[inline]
+const fn decode_base64url_byte(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// Decodes URL-safe Base64 (accepting both unpadded and `=`-padded input).
+pub fn base64url_decode(input: &str) -> Result<Vec<u8>, TokenError> {
+    let bytes = input.as_bytes();
+    let unpadded = if let Some(eq_pos) = bytes.iter().position(|&b| b == b'=') {
+        let pad_len = bytes.len() - eq_pos;
+        if !bytes.len().is_multiple_of(4)
+            || pad_len > 2
+            || !bytes[eq_pos..].iter().all(|&b| b == b'=')
+        {
+            return Err(TokenError::InvalidBase64);
+        }
+        &bytes[..eq_pos]
+    } else {
+        bytes
+    };
+
+    if unpadded.len() % 4 == 1 {
+        return Err(TokenError::InvalidBase64);
+    }
+
+    let mut out = Vec::with_capacity((unpadded.len() * 3) / 4);
+    let (chunks, rem) = unpadded.as_chunks::<4>();
+    for &[c0, c1, c2, c3] in chunks {
+        let v0 = decode_base64url_byte(c0).ok_or(TokenError::InvalidBase64)?;
+        let v1 = decode_base64url_byte(c1).ok_or(TokenError::InvalidBase64)?;
+        let v2 = decode_base64url_byte(c2).ok_or(TokenError::InvalidBase64)?;
+        let v3 = decode_base64url_byte(c3).ok_or(TokenError::InvalidBase64)?;
+        out.push((v0 << 2) | (v1 >> 4));
+        out.push((v1 << 4) | (v2 >> 2));
+        out.push((v2 << 6) | v3);
+    }
+
+    if rem.len() == 2 {
+        let v0 = decode_base64url_byte(rem[0]).ok_or(TokenError::InvalidBase64)?;
+        let v1 = decode_base64url_byte(rem[1]).ok_or(TokenError::InvalidBase64)?;
+        if (v1 & 0x0f) != 0 {
+            return Err(TokenError::InvalidBase64);
+        }
+        out.push((v0 << 2) | (v1 >> 4));
+    } else if rem.len() == 3 {
+        let v0 = decode_base64url_byte(rem[0]).ok_or(TokenError::InvalidBase64)?;
+        let v1 = decode_base64url_byte(rem[1]).ok_or(TokenError::InvalidBase64)?;
+        let v2 = decode_base64url_byte(rem[2]).ok_or(TokenError::InvalidBase64)?;
+        if (v2 & 0x03) != 0 {
+            return Err(TokenError::InvalidBase64);
+        }
+        out.push((v0 << 2) | (v1 >> 4));
+        out.push((v1 << 4) | (v2 >> 2));
+    }
+
+    Ok(out)
+}
+
+/// Encodes a stateless bearer token `<base64url(payload)>.<base64url(sshsig_pem)>`
+/// after validating the payload format and `SSHSIG` PEM boundaries.
+pub fn encode_bearer_token(payload: &str, sshsig_pem: &str) -> Result<String, TokenError> {
+    let _ = parse_token_payload(payload)?;
+    let trimmed_pem = validate_and_trim_sshsig_pem(sshsig_pem)?;
+    let payload_b64 = base64url_encode(payload.as_bytes());
+    let sig_b64 = base64url_encode(trimmed_pem.as_bytes());
+    Ok(format!("{payload_b64}.{sig_b64}"))
+}
+
+/// Decodes a `<base64url(payload)>.<base64url(sshsig_pem)>` bearer token
+/// (stripping an optional leading `"Bearer "` prefix).
+pub fn decode_bearer_token(token: &str) -> Result<DecodedToken, TokenError> {
+    let trimmed = token.trim();
+    let raw = if trimmed.len() >= 7
+        && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"bearer")
+        && trimmed.as_bytes()[6].is_ascii_whitespace()
+    {
+        trimmed[7..].trim()
+    } else {
+        trimmed
+    };
+
+    if raw.is_empty() {
+        return Err(TokenError::MalformedToken);
+    }
+
+    let (payload_b64, sig_b64) = raw.split_once('.').ok_or(TokenError::MalformedToken)?;
+    if payload_b64.is_empty() || sig_b64.is_empty() || sig_b64.contains('.') {
+        return Err(TokenError::MalformedToken);
+    }
+
+    let payload_bytes = base64url_decode(payload_b64)?;
+    let sig_bytes = base64url_decode(sig_b64)?;
+
+    let payload = String::from_utf8(payload_bytes).map_err(|_| TokenError::InvalidUtf8)?;
+    let sig_raw = String::from_utf8(sig_bytes).map_err(|_| TokenError::InvalidUtf8)?;
+    let sshsig_pem = validate_and_trim_sshsig_pem(&sig_raw)?.to_owned();
+
+    let (username, exp_unix_secs) = parse_token_payload(&payload)?;
+    Ok(DecodedToken {
+        username: username.to_owned(),
+        payload,
+        sshsig_pem,
+        exp_unix_secs,
+    })
+}
+
+/// Validates token claims (`username` identifier syntax, expiration in the future,
+/// and remaining lifetime within `max_ttl_secs`).
+pub fn validate_token_claims(
+    username: &str,
+    exp_unix_secs: u64,
+    now_unix_secs: u64,
+    max_ttl_secs: u64,
+) -> Result<(), TokenError> {
+    if !is_valid_identifier(username) {
+        return Err(TokenError::InvalidUsername);
+    }
+    if exp_unix_secs <= now_unix_secs {
+        return Err(TokenError::TokenExpired);
+    }
+    if exp_unix_secs.saturating_sub(now_unix_secs) > max_ttl_secs {
+        return Err(TokenError::TokenTtlExceeded);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -484,5 +758,156 @@ mod tests {
         assert!(lpm_bytes.len() > 5);
         let grpc_view = GetAuthStatusResponseView::from_bytes(&lpm_bytes[5..]).unwrap();
         assert!(grpc_view.authenticated().unwrap());
+    }
+
+    #[test]
+    fn formats_and_parses_token_payload_and_sign_command() {
+        let payload = format_token_payload("alice_01", 1_700_000_000).expect("valid username");
+        assert_eq!(payload, "ro-git:v1:alice_01:1700000000");
+
+        let (user, exp) = parse_token_payload(&payload).expect("parse payload");
+        assert_eq!(user, "alice_01");
+        assert_eq!(exp, 1_700_000_000);
+
+        let cmd =
+            format_ssh_keygen_sign_command("alice_01", 1_700_000_000).expect("valid sign command");
+        assert_eq!(
+            cmd,
+            "printf 'ro-git:v1:alice_01:1700000000' | ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n ro-git"
+        );
+
+        assert!(format_token_payload("", 1_700_000_000).is_none());
+        assert!(format_token_payload("alice/bob", 1_700_000_000).is_none());
+        assert!(format_ssh_keygen_sign_command("bad:user", 1_700_000_000).is_none());
+
+        assert_eq!(
+            parse_token_payload("ro-git:v2:alice:1700000000"),
+            Err(TokenError::InvalidVersionPrefix)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1"),
+            Err(TokenError::InvalidPayloadFormat)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1:alice"),
+            Err(TokenError::InvalidPayloadFormat)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1:alice:1700000000:extra"),
+            Err(TokenError::InvalidPayloadFormat)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1:../alice:1700000000"),
+            Err(TokenError::InvalidUsername)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1:alice:notanumber"),
+            Err(TokenError::InvalidExpiration)
+        );
+        assert_eq!(
+            parse_token_payload("ro-git:v1:alice:"),
+            Err(TokenError::InvalidExpiration)
+        );
+    }
+
+    #[test]
+    fn roundtrips_base64url_and_bearer_tokens() {
+        for sample in [
+            &b""[..],
+            &b"a"[..],
+            &b"ab"[..],
+            &b"abc"[..],
+            &b"ro-git:v1:alice:1700000000"[..],
+            &[0x00, 0xff, 0xfe, 0xfd, 0x7f, 0x80],
+        ] {
+            let encoded = base64url_encode(sample);
+            assert!(!encoded.contains('='));
+            let decoded = base64url_decode(&encoded).expect("decode unpadded base64url");
+            assert_eq!(decoded, sample);
+        }
+
+        // Accepts padded base64url as well
+        assert_eq!(base64url_decode("YQ==").unwrap(), b"a");
+        assert_eq!(base64url_decode("YWI=").unwrap(), b"ab");
+
+        // Rejects invalid base64url inputs
+        assert_eq!(base64url_decode("a"), Err(TokenError::InvalidBase64));
+        assert_eq!(base64url_decode("YQ="), Err(TokenError::InvalidBase64));
+        assert_eq!(base64url_decode("!!!!"), Err(TokenError::InvalidBase64));
+
+        let payload = "ro-git:v1:alice:1700086400";
+        let sample_pem = "\
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAA=
+-----END SSH SIGNATURE-----
+";
+        let token = encode_bearer_token(payload, sample_pem).expect("encode bearer token");
+        let decoded = decode_bearer_token(&token).expect("decode raw token");
+        assert_eq!(decoded.username, "alice");
+        assert_eq!(decoded.exp_unix_secs, 1_700_086_400);
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.sshsig_pem, sample_pem.trim());
+
+        let with_bearer = format!("  Bearer   {token}  ");
+        let decoded_bearer = decode_bearer_token(&with_bearer).expect("decode Bearer header");
+        assert_eq!(decoded_bearer, decoded);
+
+        // Rejects malformed tokens or missing PEM boundaries
+        assert_eq!(decode_bearer_token(""), Err(TokenError::MalformedToken));
+        assert_eq!(
+            decode_bearer_token("Bearer "),
+            Err(TokenError::MalformedToken)
+        );
+        assert_eq!(
+            decode_bearer_token("no-dot-separator"),
+            Err(TokenError::MalformedToken)
+        );
+        assert_eq!(
+            decode_bearer_token("a.b.c"),
+            Err(TokenError::MalformedToken)
+        );
+        assert_eq!(
+            encode_bearer_token(payload, "not a pem"),
+            Err(TokenError::InvalidSignaturePem)
+        );
+        assert_eq!(
+            encode_bearer_token(
+                payload,
+                "-----BEGIN SSH SIGNATURE-----\n   \n-----END SSH SIGNATURE-----"
+            ),
+            Err(TokenError::InvalidSignaturePem)
+        );
+    }
+
+    #[test]
+    fn validates_token_claims_ttl_and_expiration() {
+        let now = 1_700_000_000;
+        let max_ttl = 2_592_000; // 30 days
+
+        assert_eq!(
+            validate_token_claims("alice", now + 3_600, now, max_ttl),
+            Ok(())
+        );
+        assert_eq!(
+            validate_token_claims("alice", now + max_ttl, now, max_ttl),
+            Ok(())
+        );
+        assert_eq!(
+            validate_token_claims("alice", now, now, max_ttl),
+            Err(TokenError::TokenExpired)
+        );
+        assert_eq!(
+            validate_token_claims("alice", now - 1, now, max_ttl),
+            Err(TokenError::TokenExpired)
+        );
+        assert_eq!(
+            validate_token_claims("alice", now + max_ttl + 1, now, max_ttl),
+            Err(TokenError::TokenTtlExceeded)
+        );
+        assert_eq!(
+            validate_token_claims("bad/user", now + 60, now, max_ttl),
+            Err(TokenError::InvalidUsername)
+        );
     }
 }
