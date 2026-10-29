@@ -58,6 +58,224 @@ message ListRepositoriesResponse {
   string ssh_host = 3;
 }
 
+// Git branch or tag reference metadata.
+message RefInfo {
+  // Short ref name (e.g. `"main"` or `"v1.0.0"`).
+  string name = 1;
+  // Canonical ref name (e.g. `"refs/heads/main"` or `"refs/tags/v1.0.0"`).
+  string full_name = 2;
+  // Resolved 40-hex commit/target SHA.
+  string oid = 3;
+}
+
+// Single entry in a Git tree object.
+message TreeEntry {
+  // File mode string (e.g. `"100644"`, `"100755"`, `"040000"`, `"120000"`, `"160000"`).
+  string mode = 1;
+  // Entry kind (`"file"`, `"dir"`, `"submodule"`, or `"symlink"`).
+  string kind = 2;
+  // Entry basename (e.g. `"README.md"`).
+  string name = 3;
+  // Repository-relative path (e.g. `"crates/ro-git-ui/README.md"`).
+  string path = 4;
+  // 40-hex object SHA.
+  string oid = 5;
+  // Blob size in bytes (`0` for directories/submodules).
+  uint64 size = 6;
+}
+
+// Metadata for a single Git commit.
+message CommitInfo {
+  // 40-hex commit SHA.
+  string oid = 1;
+  // Parent 40-hex commit SHAs.
+  repeated string parent_oids = 2;
+  // Commit author name.
+  string author_name = 3;
+  // Commit author email.
+  string author_email = 4;
+  // Commit author UNIX timestamp in seconds.
+  int64 author_time_secs = 5;
+  // Committer name.
+  string committer_name = 6;
+  // Committer email.
+  string committer_email = 7;
+  // Committer UNIX timestamp in seconds.
+  int64 committer_time_secs = 8;
+  // First line of commit message.
+  string subject = 9;
+  // Full commit message.
+  string message = 10;
+}
+
+// Per-file diff statistics and unified patch within a commit.
+message CommitFileDiff {
+  // Current repository-relative path.
+  string path = 1;
+  // Previous path for renames/copies (empty otherwise).
+  string old_path = 2;
+  // Change status (`"added"`, `"modified"`, `"deleted"`, `"renamed"`, `"copied"`, `"typechange"`).
+  string status = 3;
+  // Number of added lines in this file.
+  uint32 additions = 4;
+  // Number of deleted lines in this file.
+  uint32 deletions = 5;
+  // Unified diff patch for this file.
+  string patch = 6;
+}
+
+// Request parameters for inspecting repository metadata, refs, and root tree entries.
+message GetRepositoryRequest {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` or `<team>`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository name without `.git` suffix.
+  string name = 4;
+  // Optional ref/revision override; defaults to repository HEAD when empty.
+  string revision = 5;
+}
+
+// Repository metadata, refs, and root directory tree entries for a resolved revision.
+message GetRepositoryResponse {
+  // Repository metadata and clone URLs.
+  RepositoryInfo repository = 1;
+  // Default HEAD branch/ref name (e.g. `"main"`, or empty if detached/unborn).
+  string head_ref = 2;
+  // Resolved 40-hex commit SHA for HEAD/revision (or empty if empty repo).
+  string head_oid = 3;
+  // Active revision name or OID inspected.
+  string resolved_revision = 4;
+  // Branches sorted deterministically by name.
+  repeated RefInfo branches = 5;
+  // Tags sorted deterministically by name.
+  repeated RefInfo tags = 6;
+  // Root directory tree entries for the resolved revision.
+  repeated TreeEntry entries = 7;
+}
+
+// Request parameters for listing a directory tree within a repository.
+message GetTreeRequest {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` or `<team>`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository name without `.git` suffix.
+  string name = 4;
+  // Branch, tag, commit SHA, or `"HEAD"` (defaults to `"HEAD"` when empty).
+  string revision = 5;
+  // Repository-relative directory path (empty `""` for root directory).
+  string path = 6;
+}
+
+// Directory tree entries for a specific revision and path.
+message GetTreeResponse {
+  // Resolved revision inspected.
+  string revision = 1;
+  // 40-hex tree object SHA.
+  string tree_oid = 2;
+  // Normalized repository-relative directory path.
+  string path = 3;
+  // Tree entries sorted deterministically (directories first, then files).
+  repeated TreeEntry entries = 4;
+}
+
+// Request parameters for fetching a raw blob at a revision and path.
+message GetBlobRequest {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` or `<team>`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository name without `.git` suffix.
+  string name = 4;
+  // Branch, tag, commit SHA, or `"HEAD"` (defaults to `"HEAD"` when empty).
+  string revision = 5;
+  // Repository-relative file path.
+  string path = 6;
+}
+
+// Raw blob content and metadata.
+message GetBlobResponse {
+  // Resolved revision inspected.
+  string revision = 1;
+  // Normalized repository-relative file path.
+  string path = 2;
+  // 40-hex blob object SHA.
+  string oid = 3;
+  // Total blob size in bytes.
+  uint64 size = 4;
+  // Whether the blob appears to be binary.
+  bool is_binary = 5;
+  // Whether `content` was truncated due to size limits.
+  bool truncated = 6;
+  // Raw blob bytes (up to server truncation limit).
+  bytes content = 7;
+}
+
+// Request parameters for listing paginated commit history.
+message ListCommitsRequest {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` or `<team>`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository name without `.git` suffix.
+  string name = 4;
+  // Starting revision (defaults to `"HEAD"` when empty).
+  string revision = 5;
+  // Optional repository-relative path filter.
+  string path = 6;
+  // Optional maximum number of commits to return.
+  uint32 limit = 7;
+  // Optional pagination offset / skip count.
+  uint32 offset = 8;
+}
+
+// Paginated commit log entries.
+message ListCommitsResponse {
+  // Resolved starting revision.
+  string revision = 1;
+  // Commit log entries in topological/chronological order.
+  repeated CommitInfo commits = 2;
+  // Whether additional commits exist beyond this page.
+  bool has_more = 3;
+}
+
+// Request parameters for inspecting a single commit and its unified diff.
+message GetCommitRequest {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` or `<team>`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository name without `.git` suffix.
+  string name = 4;
+  // Commit SHA or ref name.
+  string revision = 5;
+}
+
+// Detailed commit metadata, per-file diffs, and combined patch.
+message GetCommitResponse {
+  // Commit metadata.
+  CommitInfo commit = 1;
+  // Per-file diff entries changed in this commit.
+  repeated CommitFileDiff files = 2;
+  // Total added lines across all changed files.
+  uint32 total_additions = 3;
+  // Total deleted lines across all changed files.
+  uint32 total_deletions = 4;
+  // Combined unified diff patch summary.
+  string patch = 5;
+}
+
 // Request envelope sent from `ro-git-server` to the privilege-separated `git-worker` over `stdin`.
 message WorkerRequest {
   // Raw bearer token (`<base64url(payload)>.<base64url(sshsig)>`), if supplied by the caller.
@@ -76,6 +294,11 @@ message WorkerRequest {
   oneof command {
     GetAuthStatusRequest get_auth_status = 10;
     ListRepositoriesRequest list_repositories = 11;
+    GetRepositoryRequest get_repository = 12;
+    GetTreeRequest get_tree = 13;
+    GetBlobRequest get_blob = 14;
+    ListCommitsRequest list_commits = 15;
+    GetCommitRequest get_commit = 16;
   }
 }
 
@@ -89,11 +312,16 @@ message WorkerResponse {
   oneof result {
     GetAuthStatusResponse auth_status = 10;
     ListRepositoriesResponse list_repositories = 11;
+    GetRepositoryResponse get_repository = 12;
+    GetTreeResponse get_tree = 13;
+    GetBlobResponse get_blob = 14;
+    ListCommitsResponse list_commits = 15;
+    GetCommitResponse get_commit = 16;
   }
 }
 
-// Read-Only Git service exposing repository discovery and authentication status
-// over both gRPC (HTTP/2) and `google.api.http` endpoints (HTTP/1.1 & HTTP/2).
+// Read-Only Git service exposing repository discovery, authentication status, and
+// Git object inspection over both gRPC (HTTP/2) and `google.api.http` endpoints (HTTP/1.1 & HTTP/2).
 service GitService {
   // Returns the caller's authentication status and the server's configured SSH host.
   rpc GetAuthStatus(GetAuthStatusRequest) returns (GetAuthStatusResponse) {
@@ -109,4 +337,40 @@ service GitService {
       get: "/api/v1/repositories"
     };
   }
+
+  // Returns repository metadata, branches, tags, HEAD info, and root directory tree entries.
+  rpc GetRepository(GetRepositoryRequest) returns (GetRepositoryResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories/{scope}/{owner}/{visibility}/{name}"
+    };
+  }
+
+  // Returns directory tree entries at a given revision and repository-relative path.
+  rpc GetTree(GetTreeRequest) returns (GetTreeResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories/{scope}/{owner}/{visibility}/{name}/tree"
+    };
+  }
+
+  // Returns raw blob content and metadata at a given revision and repository-relative file path.
+  rpc GetBlob(GetBlobRequest) returns (GetBlobResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories/{scope}/{owner}/{visibility}/{name}/blob"
+    };
+  }
+
+  // Lists paginated commit history starting from a revision (with optional path filter).
+  rpc ListCommits(ListCommitsRequest) returns (ListCommitsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories/{scope}/{owner}/{visibility}/{name}/commits"
+    };
+  }
+
+  // Returns detailed commit metadata, per-file diff statistics, and unified patches.
+  rpc GetCommit(GetCommitRequest) returns (GetCommitResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories/{scope}/{owner}/{visibility}/{name}/commit"
+    };
+  }
 }
+

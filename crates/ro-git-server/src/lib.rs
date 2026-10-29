@@ -17,7 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ro_git_proto::grpc::ro_git::v1::git_service::{GitService, GitServiceServer};
 use ro_git_proto::ro_git::v1::{
     worker_request, worker_response, GetAuthStatusRequestView, GetAuthStatusResponseBuilder,
-    GetAuthStatusResponseView, ListRepositoriesRequestBuilder, ListRepositoriesRequestView,
+    GetAuthStatusResponseView, GetBlobRequestView, GetBlobResponseBuilder, GetCommitRequestView,
+    GetCommitResponseBuilder, GetRepositoryRequestView, GetRepositoryResponseBuilder,
+    GetTreeRequestView, GetTreeResponseBuilder, ListCommitsRequestView,
+    ListCommitsResponseBuilder, ListRepositoriesRequestBuilder, ListRepositoriesRequestView,
     ListRepositoriesResponseBuilder, ListRepositoriesResponseView, WorkerRequestBuilder,
     WorkerRequestView, WorkerResponseBuilder, WorkerResponseView,
 };
@@ -929,6 +932,16 @@ pub fn execute_worker_request_bytes(req_bytes: &[u8]) -> Vec<u8> {
                 }
             }
         }
+        Ok(Some(
+            worker_request::Command::GetRepository(_)
+            | worker_request::Command::GetTree(_)
+            | worker_request::Command::GetBlob(_)
+            | worker_request::Command::ListCommits(_)
+            | worker_request::Command::GetCommit(_),
+        )) => encode_worker_error(
+            GrpcCode::Unimplemented,
+            "git object inspection command is not yet implemented",
+        ),
         Ok(None) => encode_worker_error(GrpcCode::InvalidArgument, "missing worker command"),
         Err(_) => encode_worker_error(GrpcCode::InvalidArgument, "invalid worker command oneof"),
     }
@@ -1062,11 +1075,15 @@ fn status_from_worker_code(code: u32) -> GrpcStatus<'static> {
         c if c == GrpcCode::InvalidArgument as u32 => {
             GrpcStatus::invalid_argument("invalid worker request")
         }
+        c if c == GrpcCode::NotFound as u32 => GrpcStatus::not_found("not found"),
         c if c == GrpcCode::PermissionDenied as u32 => {
             GrpcStatus::permission_denied("permission denied")
         }
         c if c == GrpcCode::ResourceExhausted as u32 => {
             GrpcStatus::resource_exhausted("worker response buffer exhausted")
+        }
+        c if c == GrpcCode::Unimplemented as u32 => {
+            GrpcStatus::unimplemented("unimplemented worker command")
         }
         c if c == GrpcCode::Unauthenticated as u32 => {
             GrpcStatus::unauthenticated("unauthenticated or invalid SSH signature token")
@@ -1287,6 +1304,134 @@ impl GitService for GitServiceHandler {
                 "missing ListRepositories in WorkerResponse",
             )),
         }
+    }
+
+    fn get_repository<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        req: GetRepositoryRequestView<'a>,
+        _resp: &mut GetRepositoryResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let scope = req.scope().unwrap_or("");
+        let owner = req.owner().unwrap_or("");
+        let visibility = req.visibility().unwrap_or("");
+        let name = req.name().unwrap_or("");
+
+        self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_get_repository(|gr| {
+                gr.write_name(name)
+                    .write_visibility(visibility)
+                    .write_owner(owner)
+                    .write_scope(scope);
+            });
+        })?;
+        Err(GrpcStatus::unimplemented("unimplemented"))
+    }
+
+    fn get_tree<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        req: GetTreeRequestView<'a>,
+        _resp: &mut GetTreeResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let scope = req.scope().unwrap_or("");
+        let owner = req.owner().unwrap_or("");
+        let visibility = req.visibility().unwrap_or("");
+        let name = req.name().unwrap_or("");
+        let revision = req.revision().unwrap_or("");
+        let path = req.path().unwrap_or("");
+
+        self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_get_tree(|gt| {
+                gt.write_path(path)
+                    .write_revision(revision)
+                    .write_name(name)
+                    .write_visibility(visibility)
+                    .write_owner(owner)
+                    .write_scope(scope);
+            });
+        })?;
+        Err(GrpcStatus::unimplemented("unimplemented"))
+    }
+
+    fn get_blob<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        req: GetBlobRequestView<'a>,
+        _resp: &mut GetBlobResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let scope = req.scope().unwrap_or("");
+        let owner = req.owner().unwrap_or("");
+        let visibility = req.visibility().unwrap_or("");
+        let name = req.name().unwrap_or("");
+        let revision = req.revision().unwrap_or("");
+        let path = req.path().unwrap_or("");
+
+        self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_get_blob(|gb| {
+                gb.write_path(path)
+                    .write_revision(revision)
+                    .write_name(name)
+                    .write_visibility(visibility)
+                    .write_owner(owner)
+                    .write_scope(scope);
+            });
+        })?;
+        Err(GrpcStatus::unimplemented("unimplemented"))
+    }
+
+    fn list_commits<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        req: ListCommitsRequestView<'a>,
+        _resp: &mut ListCommitsResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let scope = req.scope().unwrap_or("");
+        let owner = req.owner().unwrap_or("");
+        let visibility = req.visibility().unwrap_or("");
+        let name = req.name().unwrap_or("");
+        let revision = req.revision().unwrap_or("");
+        let path = req.path().unwrap_or("");
+        let limit = req.limit().unwrap_or(0);
+        let offset = req.offset().unwrap_or(0);
+
+        self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_list_commits(|lc| {
+                lc.write_offset(offset)
+                    .write_limit(limit)
+                    .write_path(path)
+                    .write_revision(revision)
+                    .write_name(name)
+                    .write_visibility(visibility)
+                    .write_owner(owner)
+                    .write_scope(scope);
+            });
+        })?;
+        Err(GrpcStatus::unimplemented("unimplemented"))
+    }
+
+    fn get_commit<'a, 'b>(
+        &self,
+        meta: &mut RpcMetadata<'_>,
+        req: GetCommitRequestView<'a>,
+        _resp: &mut GetCommitResponseBuilder<'b>,
+    ) -> Result<(), GrpcStatus<'static>> {
+        let scope = req.scope().unwrap_or("");
+        let owner = req.owner().unwrap_or("");
+        let visibility = req.visibility().unwrap_or("");
+        let name = req.name().unwrap_or("");
+        let revision = req.revision().unwrap_or("");
+
+        self.execute_worker_command(meta, |req_builder| {
+            req_builder.write_get_commit(|gc| {
+                gc.write_revision(revision)
+                    .write_name(name)
+                    .write_visibility(visibility)
+                    .write_owner(owner)
+                    .write_scope(scope);
+            });
+        })?;
+        Err(GrpcStatus::unimplemented("unimplemented"))
     }
 }
 
@@ -2655,5 +2800,20 @@ TBcf2gHOcj9Ai0txbeMkVRWweq\n\
             .call_unary(&mut bad_meta, "GetAuthStatus", &[], &mut writer)
             .expect_err("invalid token must fail");
         assert_eq!(err.code, GrpcCode::Unauthenticated);
+
+        for method in [
+            "GetRepository",
+            "GetTree",
+            "GetBlob",
+            "ListCommits",
+            "GetCommit",
+        ] {
+            let mut meta = ctx.metadata();
+            let mut writer = BackwardWriter::new(&mut out_buf);
+            let err = server
+                .call_unary(&mut meta, method, &[], &mut writer)
+                .expect_err("unimplemented object inspection RPC must return error");
+            assert_eq!(err.code, GrpcCode::Unimplemented, "method {method}");
+        }
     }
 }
