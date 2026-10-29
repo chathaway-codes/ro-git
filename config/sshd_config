@@ -1,0 +1,6 @@
+AuthorizedKeysFile /users/%u/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+StrictModes yes
+UsePAM no

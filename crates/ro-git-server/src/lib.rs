@@ -38,43 +38,42 @@ impl ServerConfig {
     /// Loads server configuration from `RO_GIT_*` environment variables with defaults.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Resolves server configuration using a custom environment lookup function,
+    /// trimming surrounding whitespace and falling back to defaults on empty or invalid values.
+    #[must_use]
+    pub fn from_lookup<F>(lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let non_empty = |key: &str| -> Option<String> {
+            lookup(key)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+
         let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("RO_GIT_LISTEN_ADDR") {
-            if !val.trim().is_empty() {
-                cfg.listen_addr = val;
-            }
+        if let Some(val) = non_empty("RO_GIT_LISTEN_ADDR") {
+            cfg.listen_addr = val;
         }
-        if let Ok(val) = std::env::var("RO_GIT_ROOT") {
-            if !val.trim().is_empty() {
-                cfg.root_dir = val;
-            }
+        if let Some(val) = non_empty("RO_GIT_ROOT") {
+            cfg.root_dir = val;
         }
-        if let Ok(val) = std::env::var("RO_GIT_SSH_HOST") {
-            if !val.trim().is_empty() {
-                cfg.ssh_host = val;
-            }
+        if let Some(val) = non_empty("RO_GIT_SSH_HOST") {
+            cfg.ssh_host = val;
         }
-        if let Ok(val) = std::env::var("RO_GIT_STATIC_DIR") {
-            if !val.trim().is_empty() {
-                cfg.static_dir = val;
-            }
+        if let Some(val) = non_empty("RO_GIT_STATIC_DIR") {
+            cfg.static_dir = val;
         }
-        if let Ok(val) = std::env::var("RO_GIT_MAX_TOKEN_TTL_SECS") {
-            if let Ok(parsed) = val.trim().parse::<u64>() {
-                cfg.max_token_ttl_secs = parsed;
-            }
+        if let Some(parsed) = non_empty("RO_GIT_MAX_TOKEN_TTL_SECS").and_then(|v| v.parse().ok()) {
+            cfg.max_token_ttl_secs = parsed;
         }
-        if let Ok(val) = std::env::var("RO_GIT_NOBODY_UID") {
-            if let Ok(parsed) = val.trim().parse::<u32>() {
-                cfg.nobody_uid = parsed;
-            }
+        if let Some(parsed) = non_empty("RO_GIT_NOBODY_UID").and_then(|v| v.parse().ok()) {
+            cfg.nobody_uid = parsed;
         }
-        if let Ok(val) = std::env::var("RO_GIT_DEV_USER") {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                cfg.dev_user = Some(trimmed.to_owned());
-            }
-        }
+        cfg.dev_user = non_empty("RO_GIT_DEV_USER");
         cfg
     }
 }
@@ -150,16 +149,76 @@ mod tests {
     }
 
     #[test]
+    fn from_env_and_lookup_override_and_fallback_cleanly() {
+        let cfg = ServerConfig::from_lookup(|key| match key {
+            "RO_GIT_LISTEN_ADDR" => Some(String::from(" 127.0.0.1:9090 ")),
+            "RO_GIT_ROOT" => Some(String::from(" /srv/ro-git ")),
+            "RO_GIT_SSH_HOST" => Some(String::from(" git.example.com:2222 ")),
+            "RO_GIT_STATIC_DIR" => Some(String::from(" /var/www/ro-git ")),
+            "RO_GIT_MAX_TOKEN_TTL_SECS" => Some(String::from(" 86400 ")),
+            "RO_GIT_NOBODY_UID" => Some(String::from(" 10001 ")),
+            "RO_GIT_DEV_USER" => Some(String::from(" alice ")),
+            _ => None,
+        });
+        assert_eq!(cfg.listen_addr, "127.0.0.1:9090");
+        assert_eq!(cfg.root_dir, "/srv/ro-git");
+        assert_eq!(cfg.ssh_host, "git.example.com:2222");
+        assert_eq!(cfg.static_dir, "/var/www/ro-git");
+        assert_eq!(cfg.max_token_ttl_secs, 86_400);
+        assert_eq!(cfg.nobody_uid, 10_001);
+        assert_eq!(cfg.dev_user.as_deref(), Some("alice"));
+
+        let fallback = ServerConfig::from_lookup(|key| match key {
+            "RO_GIT_LISTEN_ADDR" => Some(String::from("   ")),
+            "RO_GIT_MAX_TOKEN_TTL_SECS" => Some(String::from("not-a-number")),
+            "RO_GIT_NOBODY_UID" => Some(String::from("-1")),
+            "RO_GIT_DEV_USER" => Some(String::from("")),
+            _ => None,
+        });
+        assert_eq!(fallback, ServerConfig::default());
+
+        let env_cfg = ServerConfig::from_env();
+        assert!(!env_cfg.listen_addr.is_empty());
+        assert!(!env_cfg.ssh_host.is_empty());
+    }
+
+    #[test]
     fn git_service_handler_serves_auth_status_and_repositories_over_http() {
+        let mut scratch = [0u8; 512];
+        let mut out_buf = [0u8; 512];
+
+        // 1. Default anonymous handler (`dev_user: None`)
+        let anon_server = GitServiceHandler::default().into_server();
+        let auth_req = HttpRequest::from_uri(HttpMethod::Get, API_AUTH_STATUS_PATH, None, &[]);
+        let mut writer = BackwardWriter::new(&mut out_buf);
+        let anon_auth_resp = anon_server
+            .call_http(&auth_req, &mut scratch, &mut writer)
+            .expect("matched /api/v1/auth/status")
+            .expect("ok response");
+        assert_eq!(anon_auth_resp.status_code, 200);
+        let anon_auth_view = GetAuthStatusResponseView::from_bytes(anon_auth_resp.body).unwrap();
+        assert!(!anon_auth_view.authenticated().unwrap());
+        assert_eq!(anon_auth_view.username().unwrap(), "");
+        assert_eq!(anon_auth_view.ssh_host().unwrap(), "localhost");
+
+        let repos_req = HttpRequest::from_uri(HttpMethod::Get, API_REPOSITORIES_PATH, None, &[]);
+        let mut writer = BackwardWriter::new(&mut out_buf);
+        let anon_repos_resp = anon_server
+            .call_http(&repos_req, &mut scratch, &mut writer)
+            .expect("matched /api/v1/repositories")
+            .expect("ok response");
+        assert_eq!(anon_repos_resp.status_code, 200);
+        let anon_repos_view =
+            ListRepositoriesResponseView::from_bytes(anon_repos_resp.body).unwrap();
+        assert_eq!(anon_repos_view.authenticated_user().unwrap(), "");
+        assert_eq!(anon_repos_view.ssh_host().unwrap(), "localhost");
+
+        // 2. Authenticated handler (`dev_user: Some("charles")`)
         let mut cfg = ServerConfig::default();
         cfg.ssh_host = String::from("git.team.internal");
         cfg.dev_user = Some(String::from("charles"));
         let server = GitServiceHandler::new(cfg).into_server();
 
-        let mut scratch = [0u8; 512];
-        let mut out_buf = [0u8; 512];
-
-        let auth_req = HttpRequest::from_uri(HttpMethod::Get, API_AUTH_STATUS_PATH, None, &[]);
         let mut writer = BackwardWriter::new(&mut out_buf);
         let auth_resp = server
             .call_http(&auth_req, &mut scratch, &mut writer)
@@ -171,7 +230,6 @@ mod tests {
         assert_eq!(auth_view.username().unwrap(), "charles");
         assert_eq!(auth_view.ssh_host().unwrap(), "git.team.internal");
 
-        let repos_req = HttpRequest::from_uri(HttpMethod::Get, API_REPOSITORIES_PATH, None, &[]);
         let mut writer = BackwardWriter::new(&mut out_buf);
         let repos_resp = server
             .call_http(&repos_req, &mut scratch, &mut writer)

@@ -80,6 +80,7 @@ pub fn format_canonical_path(scope: &str, owner: &str, visibility: &str, name: &
 
 /// Formats the raw SSH URL (without username):
 /// `ssh://<host>/<scope>/<owner>/<visibility>/<name>.git`
+#[inline]
 #[must_use]
 pub fn format_ssh_url(
     ssh_host: &str,
@@ -88,9 +89,7 @@ pub fn format_ssh_url(
     visibility: &str,
     name: &str,
 ) -> String {
-    let host = normalize_ssh_host(ssh_host);
-    let path = format_canonical_path(scope, owner, visibility, name);
-    format!("ssh://{host}{path}")
+    format_authenticated_ssh_url(ssh_host, None, scope, owner, visibility, name)
 }
 
 /// Formats an SSH URL including `<user>@` when `authenticated_user` is provided and non-empty:
@@ -147,6 +146,14 @@ mod tests {
 
     #[test]
     fn formats_canonical_paths_ssh_urls_and_clone_commands() {
+        assert_eq!(normalize_ssh_host(""), "localhost");
+        assert_eq!(normalize_ssh_host("   "), "localhost");
+        assert_eq!(normalize_ssh_host("ssh:///"), "localhost");
+        assert_eq!(
+            normalize_ssh_host("ssh://git.example.com:2222/"),
+            "git.example.com:2222"
+        );
+
         assert_eq!(
             format_canonical_path("users", "alice", "public", "notes"),
             "/users/alice/public/notes.git"
@@ -163,6 +170,10 @@ mod tests {
         assert_eq!(
             format_ssh_url("ssh://localhost:2222/", "teams", "core", "private", "infra"),
             "ssh://localhost:2222/teams/core/private/infra.git"
+        );
+        assert_eq!(
+            format_ssh_url("", "users", "alice", "public", "notes"),
+            "ssh://localhost/users/alice/public/notes.git"
         );
 
         assert_eq!(
