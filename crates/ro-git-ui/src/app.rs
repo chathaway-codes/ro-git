@@ -774,6 +774,22 @@ pub fn app() -> Html {
             let target_route = target_route.clone();
             let mut current_auth = (*auth_status).clone();
 
+            let should_clear_overview = match (target_route.repo(), (*repo_overview).as_ref()) {
+                (Some(target_repo), Some(ov)) => {
+                    ov.repository.coordinates().as_ref() != Some(target_repo)
+                }
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if should_clear_overview {
+                repo_overview.set(None);
+                tree_view.set(None);
+                readme_blob.set(None);
+                blob_view.set(None);
+                commit_list.set(None);
+                commit_detail.set(None);
+            }
+
             loading.set(true);
             load_error.set(None);
 
@@ -1432,8 +1448,12 @@ pub fn app() -> Html {
             }
         }
         repo_route => {
-            let repo = repo_route.repo().expect("repository route has coordinates");
-            let overview_ref = (*repo_overview).as_ref();
+            let Some(repo) = repo_route.repo() else {
+                return html! {};
+            };
+            let overview_ref = (*repo_overview)
+                .as_ref()
+                .filter(|ov| ov.repository.coordinates().as_ref() == Some(repo));
             let effective_rev = repo_route
                 .active_revision()
                 .or_else(|| overview_ref.map(RepositoryOverviewModel::effective_revision))
@@ -1535,10 +1555,18 @@ pub fn app() -> Html {
                 }
                 AppRoute::Blob { .. } => {
                     if let Some(bv) = (*blob_view).as_ref() {
+                        let entry_mode = (*tree_view)
+                            .as_ref()
+                            .and_then(|tv| tv.entries.iter().find(|e| e.path == bv.path))
+                            .or_else(|| {
+                                overview_ref
+                                    .and_then(|ov| ov.entries.iter().find(|e| e.path == bv.path))
+                            })
+                            .map(|e| e.mode.as_str());
                         render_blob_view(
                             repo,
                             bv,
-                            None,
+                            entry_mode,
                             *blob_view_mode,
                             on_blob_mode_change,
                             &on_navigate,

@@ -1486,7 +1486,8 @@ fn make_nav_click(on_navigate: &Callback<AppRoute>, target: AppRoute) -> Callbac
 
 /// Renders the repository header (`scope / owner / visibility / name`, visibility badge,
 /// `git clone` snippet, Branch & Tag selector `<select>`, and `Tree` / `Commits` tabs).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::double_must_use)]
+#[must_use]
 pub fn render_repository_header(
     repo: &RepoCoordinates,
     overview: Option<&RepositoryOverviewModel>,
@@ -1688,6 +1689,8 @@ pub fn render_repository_header(
 }
 
 /// Renders clickable path breadcrumbs (`repo / dir1 / dir2 / ...`).
+#[allow(clippy::double_must_use)]
+#[must_use]
 pub fn render_path_breadcrumbs(
     repo: &RepoCoordinates,
     revision: &str,
@@ -1738,7 +1741,8 @@ pub fn render_path_breadcrumbs(
 
 /// Renders the directory tree view (breadcrumbs, directory table with optional `..` row,
 /// empty/unborn repository state, and automatic client-side `README.md` panel).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::double_must_use)]
+#[must_use]
 pub fn render_tree_view(
     repo: &RepoCoordinates,
     revision: &str,
@@ -1923,6 +1927,8 @@ fn render_tree_entry_row(
 
 /// Renders the blob viewer (breadcrumbs, metadata bar, `Rendered` vs. `Raw` toggle for Markdown,
 /// binary file indicator, truncation warning, and line-numbered source code view).
+#[allow(clippy::double_must_use)]
+#[must_use]
 pub fn render_blob_view(
     repo: &RepoCoordinates,
     blob: &BlobViewModel,
@@ -1933,7 +1939,7 @@ pub fn render_blob_view(
     on_markdown_navigate: Callback<String>,
 ) -> Html {
     let is_md = blob.is_markdown();
-    let mode_label = entry_mode.filter(|m| !m.is_empty()).unwrap_or("100644");
+    let mode_label = entry_mode.map(str::trim).filter(|m| !m.is_empty());
 
     let body_html = if blob.is_binary {
         html! {
@@ -2000,10 +2006,12 @@ pub fn render_blob_view(
             <section class="blob-panel" aria-label="Blob Viewer">
                 <div class="blob-panel-header">
                     <div class="blob-meta-info">
-                        <span class="blob-meta-item">
-                            { "Mode: " }<code>{ mode_label }</code>
-                        </span>
-                        <span class="blob-meta-sep">{ "·" }</span>
+                        if let Some(mode) = mode_label {
+                            <span class="blob-meta-item">
+                                { "Mode: " }<code>{ mode }</code>
+                            </span>
+                            <span class="blob-meta-sep">{ "·" }</span>
+                        }
                         <span class="blob-meta-item">
                             { "Size: " }<code>{ blob.formatted_size() }</code>
                         </span>
@@ -2068,6 +2076,8 @@ pub fn render_blob_view(
 }
 
 /// Renders the paginated commit log (`ListCommits`) with `Previous` and `Next` controls.
+#[allow(clippy::double_must_use)]
+#[must_use]
 pub fn render_commits_view(
     repo: &RepoCoordinates,
     active_revision: &str,
@@ -2213,6 +2223,8 @@ pub fn render_commits_view(
 }
 
 /// Renders the individual commit detail header, diff summary, and per-file unified diff cards (`GetCommit`).
+#[allow(clippy::double_must_use)]
+#[must_use]
 pub fn render_commit_detail_view(
     repo: &RepoCoordinates,
     detail: &CommitDetailModel,
@@ -3016,5 +3028,265 @@ mod tests {
         assert!(decode_get_blob_response(&[0xFF, 0xFF]).is_err());
         assert!(decode_list_commits_response(&[0xFF, 0xFF]).is_err());
         assert!(decode_get_commit_response(&[]).is_err());
+
+        // RepositoryItem::root_route and RepositoryItem::coordinates (valid and invalid)
+        let repo_item = RepositoryItem::new(
+            "git.example.com",
+            Some("alice"),
+            "users",
+            "alice",
+            "public",
+            "demo",
+        );
+        assert_eq!(repo_item.root_route(), "/users/alice/public/demo");
+        assert_eq!(repo_item.coordinates(), Some(repo.clone()));
+        let mut invalid_item = repo_item.clone();
+        invalid_item.scope = "invalid_scope".to_owned();
+        assert_eq!(invalid_item.coordinates(), None);
+
+        // percent_decode_component error paths
+        assert!(percent_decode_component("%2").is_err());
+        assert!(percent_decode_component("%ZZ").is_err());
+        assert!(percent_decode_component("%FF%FE").is_err());
+
+        // AppRoute::repo, active_revision, and with_revision across all variants
+        let r_index = AppRoute::Index;
+        let r_root = AppRoute::RepoRoot { repo: repo.clone() };
+        let r_tree = AppRoute::Tree {
+            repo: repo.clone(),
+            revision: "main".to_owned(),
+            path: "src".to_owned(),
+        };
+        let r_blob = AppRoute::Blob {
+            repo: repo.clone(),
+            revision: "main".to_owned(),
+            path: "src/lib.rs".to_owned(),
+        };
+        let r_commits = AppRoute::Commits {
+            repo: repo.clone(),
+            revision: "main".to_owned(),
+            path: "src".to_owned(),
+            offset: 50,
+        };
+        let r_detail = AppRoute::CommitDetail {
+            repo: repo.clone(),
+            revision: OID_A.to_owned(),
+        };
+
+        assert_eq!(r_index.repo(), None);
+        assert_eq!(r_index.active_revision(), None);
+        assert_eq!(r_index.with_revision("dev"), AppRoute::Index);
+
+        assert_eq!(r_root.repo(), Some(&repo));
+        assert_eq!(r_root.active_revision(), None);
+        assert_eq!(
+            r_root.with_revision("dev"),
+            AppRoute::Tree {
+                repo: repo.clone(),
+                revision: "dev".to_owned(),
+                path: String::new(),
+            }
+        );
+
+        assert_eq!(r_tree.repo(), Some(&repo));
+        assert_eq!(r_tree.active_revision(), Some("main"));
+        assert_eq!(
+            r_tree.with_revision("dev"),
+            AppRoute::Tree {
+                repo: repo.clone(),
+                revision: "dev".to_owned(),
+                path: "src".to_owned(),
+            }
+        );
+
+        assert_eq!(r_blob.repo(), Some(&repo));
+        assert_eq!(r_blob.active_revision(), Some("main"));
+        assert_eq!(
+            r_blob.with_revision("dev"),
+            AppRoute::Blob {
+                repo: repo.clone(),
+                revision: "dev".to_owned(),
+                path: "src/lib.rs".to_owned(),
+            }
+        );
+
+        assert_eq!(r_commits.repo(), Some(&repo));
+        assert_eq!(r_commits.active_revision(), Some("main"));
+        assert_eq!(
+            r_commits.with_revision("dev"),
+            AppRoute::Commits {
+                repo: repo.clone(),
+                revision: "dev".to_owned(),
+                path: "src".to_owned(),
+                offset: 0,
+            }
+        );
+
+        assert_eq!(r_detail.repo(), Some(&repo));
+        assert_eq!(r_detail.active_revision(), Some(OID_A));
+        assert_eq!(
+            r_detail.with_revision("dev"),
+            AppRoute::Tree {
+                repo: repo.clone(),
+                revision: "dev".to_owned(),
+                path: String::new(),
+            }
+        );
+
+        // TreeEntryModel symlink & submodule helpers, submodule row rendering, and empty non-unborn directory
+        let symlink_entry = TreeEntryModel {
+            mode: "120000".to_owned(),
+            kind: TREE_KIND_SYMLINK.to_owned(),
+            name: "current".to_owned(),
+            path: "current".to_owned(),
+            oid: OID_A.to_owned(),
+            size: 12,
+        };
+        assert!(symlink_entry.is_symlink());
+        assert!(!symlink_entry.is_submodule());
+
+        let submodule_entry = TreeEntryModel {
+            mode: "160000".to_owned(),
+            kind: TREE_KIND_SUBMODULE.to_owned(),
+            name: "vendor-lib".to_owned(),
+            path: "vendor-lib".to_owned(),
+            oid: OID_B.to_owned(),
+            size: 0,
+        };
+        assert!(submodule_entry.is_submodule());
+        assert!(!submodule_entry.is_symlink());
+        assert_eq!(submodule_entry.formatted_size(), "—");
+
+        let submod_tree_html = render_vnode_to_html_string(&render_tree_view(
+            &repo,
+            "main",
+            "",
+            &[symlink_entry, submodule_entry],
+            false,
+            "git clone ssh://localhost/users/alice/public/demo.git",
+            None,
+            &noop_nav,
+            Callback::from(|_: String| {}),
+        ));
+        assert!(submod_tree_html.contains("vendor-lib @ 89abcde"));
+
+        let empty_dir_html = render_vnode_to_html_string(&render_tree_view(
+            &repo,
+            "main",
+            "empty-dir",
+            &[],
+            false,
+            "git clone ssh://localhost/users/alice/public/demo.git",
+            None,
+            &noop_nav,
+            Callback::from(|_: String| {}),
+        ));
+        assert!(empty_dir_html.contains("No entries found in this directory."));
+
+        // RepositoryOverviewModel::is_empty_unborn and effective_revision fallback branches
+        let mut overview = RepositoryOverviewModel {
+            repository: repo_item,
+            head_ref: "main".to_owned(),
+            head_oid: String::new(),
+            resolved_revision: "release-1".to_owned(),
+            branches: Vec::new(),
+            tags: Vec::new(),
+            entries: Vec::new(),
+        };
+        assert!(overview.is_empty_unborn());
+        assert_eq!(overview.effective_revision(), "release-1");
+        overview.resolved_revision.clear();
+        assert_eq!(overview.effective_revision(), "main");
+        overview.head_ref.clear();
+        assert_eq!(overview.effective_revision(), DEFAULT_REVISION);
+
+        // render_blob_view in BlobViewMode::Rendered for Markdown blob and with entry_mode: None
+        let rendered_md_html = render_vnode_to_html_string(&render_blob_view(
+            &repo,
+            &raw_md_blob,
+            None,
+            BlobViewMode::Rendered,
+            Callback::from(|_: BlobViewMode| {}),
+            &noop_nav,
+            Callback::from(|_: String| {}),
+        ));
+        assert!(rendered_md_html.contains("<div class=\"blob-markdown-view\">"));
+        assert!(rendered_md_html.contains("<h1>Title</h1>"));
+        assert!(!rendered_md_html.contains("Mode:"));
+
+        // All diff status badges in render_commit_detail_view
+        let all_statuses_detail = CommitDetailModel {
+            commit: CommitInfoModel {
+                parent_oids: Vec::new(),
+                ..detail.commit.clone()
+            },
+            files: vec![
+                CommitFileDiffModel {
+                    path: "a.rs".to_owned(),
+                    old_path: String::new(),
+                    status: DIFF_STATUS_ADDED.to_owned(),
+                    additions: 1,
+                    deletions: 0,
+                    patch: "+a".to_owned(),
+                },
+                CommitFileDiffModel {
+                    path: "m.rs".to_owned(),
+                    old_path: String::new(),
+                    status: DIFF_STATUS_MODIFIED.to_owned(),
+                    additions: 1,
+                    deletions: 1,
+                    patch: "-m\n+m2".to_owned(),
+                },
+                CommitFileDiffModel {
+                    path: "d.rs".to_owned(),
+                    old_path: String::new(),
+                    status: DIFF_STATUS_DELETED.to_owned(),
+                    additions: 0,
+                    deletions: 1,
+                    patch: "-d".to_owned(),
+                },
+                CommitFileDiffModel {
+                    path: "r_new.rs".to_owned(),
+                    old_path: "r_old.rs".to_owned(),
+                    status: DIFF_STATUS_RENAMED.to_owned(),
+                    additions: 0,
+                    deletions: 0,
+                    patch: String::new(),
+                },
+                CommitFileDiffModel {
+                    path: "c_new.rs".to_owned(),
+                    old_path: "c_old.rs".to_owned(),
+                    status: DIFF_STATUS_COPIED.to_owned(),
+                    additions: 0,
+                    deletions: 0,
+                    patch: String::new(),
+                },
+                CommitFileDiffModel {
+                    path: "t.rs".to_owned(),
+                    old_path: String::new(),
+                    status: DIFF_STATUS_TYPECHANGE.to_owned(),
+                    additions: 0,
+                    deletions: 0,
+                    patch: String::new(),
+                },
+            ],
+            total_additions: 2,
+            total_deletions: 2,
+            patch: String::new(),
+        };
+        let all_statuses_html = render_vnode_to_html_string(&render_commit_detail_view(
+            &repo,
+            &all_statuses_detail,
+            &noop_nav,
+        ));
+        assert!(all_statuses_html.contains("6 files changed"));
+        assert!(all_statuses_html.contains("None (root commit)"));
+        assert!(all_statuses_html.contains("diff-status-added"));
+        assert!(all_statuses_html.contains("diff-status-modified"));
+        assert!(all_statuses_html.contains("diff-status-deleted"));
+        assert!(all_statuses_html.contains("diff-status-renamed"));
+        assert!(all_statuses_html.contains("diff-status-copied"));
+        assert!(all_statuses_html.contains("diff-status-typechange"));
+        assert!(all_statuses_html.contains("c_old.rs -&gt; c_new.rs"));
     }
 }
