@@ -8,7 +8,7 @@ A minimalist, database-free SSH Git server and read-only Web UI (`linux/arm64` &
 3. **Stateless SSH Key Authentication (`sshsig`)** allowing users to sign in to the Web UI using their existing SSH key via `ssh-keygen -Y sign`.
 4. **Rust (`roto-grpc`) + Yew (WASM) Web UI**:
    - **Milestone 1 (Repository Index)**: Lists discoverable repositories grouped/filterable by user and team with one-click copy-to-clipboard for `git clone` commands and `ssh://` URLs.
-   - **Milestone 2 (Repository Browser & Markdown Viewer)**: Browse repository trees, file blobs, branches/tags, commit history, and render `README.md` / `.md` files into sanitized HTML.
+   - **Milestone 2 (Repository Browser & Client-Side Markdown Viewer)**: Backend strictly serves raw Git objects over gRPC; the Yew WASM frontend browses repository trees, file blobs, branches/tags, and commit history, and renders `README.md` / `.md` files client-side into Yew virtual DOM nodes (`pulldown-cmark`).
 
 ---
 
@@ -112,9 +112,9 @@ exec /usr/bin/git-shell -c "$cmd"
   2. Provide one-click copy-to-clipboard buttons for each repository's clone command and raw SSH URL:
      - Clone command: `git clone ssh://<host>/users/<owner>/public/<repo>.git` (or `ssh://<user>@<host>/...` when authenticated as `<user>`)
      - Raw SSH URL: `ssh://<host>/users/<owner>/public/<repo>.git`
-- **Milestone 2 — Read-Only Repository Browser & Markdown Renderer**:
-  1. Inspect repository branches/tags, directory trees, file blobs, and commit history.
-  2. Render `README.md` and `.md` blobs into sanitized HTML.
+- **Milestone 2 — Read-Only Repository Browser & Client-Side Markdown Renderer**:
+  1. Backend strictly responds to gRPC requests for repository branches/tags, directory trees, raw file blobs, and commit history.
+  2. Client-side Markdown engine in Yew WASM (`pulldown-cmark` -> Yew `VNode`) renders `README.md` and `.md` blobs directly in the browser with safe URL filtering and relative repository link routing.
 
 ### Visibility, Stateless SSH Auth & Privilege Separation
 
