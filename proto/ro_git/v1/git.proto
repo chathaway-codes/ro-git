@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package ro_git.v1;
+
+import "google/api/annotations.proto";
+
+// Empty request for querying current authentication status and SSH host configuration.
+message GetAuthStatusRequest {}
+
+// Authentication status and public SSH host returned to the Web UI and gRPC clients.
+message GetAuthStatusResponse {
+  // Whether the caller is authenticated as a valid user.
+  bool authenticated = 1;
+  // Authenticated username (empty when anonymous).
+  string username = 2;
+  // Public SSH hostname (and optional `:port`) for formatting `ssh://` URLs.
+  string ssh_host = 3;
+}
+
+// Filter parameters for listing discoverable repositories.
+message ListRepositoriesRequest {
+  // Optional scope filter: `"users"`, `"teams"`, or empty for all scopes.
+  string scope = 1;
+  // Optional owner filter (username or team name).
+  string owner = 2;
+  // Optional visibility filter: `"public"`, `"private"`, or empty for all accessible visibilities.
+  string visibility = 3;
+  // Optional case-insensitive substring query matching owner, name, or canonical path.
+  string query = 4;
+}
+
+// Metadata and pre-formatted clone strings for a single bare Git repository.
+message RepositoryInfo {
+  // Top-level namespace scope (`"users"` or `"teams"`).
+  string scope = 1;
+  // Repository owner (`<user>` for `users`, `<team>` for `teams`).
+  string owner = 2;
+  // Visibility tier (`"public"` or `"private"`).
+  string visibility = 3;
+  // Repository base name without the trailing `.git` suffix (e.g. `"my-repo"`).
+  string name = 4;
+  // Canonical 4-segment repository path (e.g. `"/users/alice/public/my-repo.git"`).
+  string canonical_path = 5;
+  // Raw SSH URL without username (e.g. `"ssh://localhost/users/alice/public/my-repo.git"`).
+  string ssh_url = 6;
+  // Ready-to-run `git clone` command (`git clone ssh://<host>/...` when anonymous,
+  // or `git clone ssh://<user>@<host>/...` when authenticated).
+  string clone_command = 7;
+}
+
+// Discoverable repositories and caller authentication context.
+message ListRepositoriesResponse {
+  // Discoverable repositories sorted deterministically by `(scope, owner, visibility, name)`.
+  repeated RepositoryInfo repositories = 1;
+  // Authenticated username if signed in (empty when anonymous).
+  string authenticated_user = 2;
+  // Public SSH hostname (and optional `:port`) configured on the server.
+  string ssh_host = 3;
+}
+
+// Request envelope sent from `ro-git-server` to the privilege-separated `git-worker` over `stdin`.
+message WorkerRequest {
+  // Raw bearer token (`<base64url(payload)>.<base64url(sshsig)>`), if supplied by the caller.
+  string token = 1;
+  // Pre-resolved username from trusted reverse-proxy header or `RO_GIT_DEV_USER` fallback.
+  string preauthenticated_user = 2;
+  // Filesystem root prefix containing `users/` and `teams/` (`RO_GIT_ROOT`).
+  string root_dir = 3;
+  // Public SSH hostname (`RO_GIT_SSH_HOST`).
+  string ssh_host = 4;
+  // Maximum allowed token TTL in seconds (`RO_GIT_MAX_TOKEN_TTL_SECS`).
+  uint64 max_token_ttl_secs = 5;
+  // Current UNIX timestamp in seconds used for signature expiration and TTL validation.
+  uint64 now_unix_secs = 6;
+
+  oneof command {
+    GetAuthStatusRequest get_auth_status = 10;
+    ListRepositoriesRequest list_repositories = 11;
+  }
+}
+
+// Response envelope written by `git-worker` to `stdout`.
+message WorkerResponse {
+  // Canonical gRPC status code (`0` = OK, `16` = Unauthenticated, `7` = PermissionDenied, etc.).
+  uint32 status_code = 1;
+  // Human-readable error message when `status_code != 0`.
+  string error_message = 2;
+
+  oneof result {
+    GetAuthStatusResponse auth_status = 10;
+    ListRepositoriesResponse list_repositories = 11;
+  }
+}
+
+// Read-Only Git service exposing repository discovery and authentication status
+// over both gRPC (HTTP/2) and `google.api.http` endpoints (HTTP/1.1 & HTTP/2).
+service GitService {
+  // Returns the caller's authentication status and the server's configured SSH host.
+  rpc GetAuthStatus(GetAuthStatusRequest) returns (GetAuthStatusResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/auth/status"
+    };
+  }
+
+  // Lists all repositories accessible to the caller (public repositories for anonymous
+  // callers, plus owned user-private and member team-private repositories when authenticated).
+  rpc ListRepositories(ListRepositoriesRequest) returns (ListRepositoriesResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/repositories"
+    };
+  }
+}

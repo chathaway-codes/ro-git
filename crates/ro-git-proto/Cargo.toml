@@ -1,0 +1,26 @@
+[package]
+name = "ro-git-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy #![no_std] Protobuf message views, builders, and roto-grpc service traits for ro-git"
+
+[features]
+default = []
+std = ["roto-grpc/std", "grpc-reflection-roto?/std"]
+server = ["std", "roto-grpc/tokio", "dep:grpc-reflection-roto", "grpc-reflection-roto/tokio"]
+
+[dependencies]
+roto.workspace = true
+roto-runtime.workspace = true
+roto-grpc.workspace = true
+google-protobuf-roto.workspace = true
+grpc-reflection-roto = { workspace = true, optional = true }
+
+[package.metadata.roto]
+proto_dir = "../../proto"
+out_dir = "src/generated"
+mode = "mod"
+grpc = true
+http = true
+descriptors = true
