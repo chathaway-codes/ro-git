@@ -135,8 +135,8 @@ pub fn normalize_repo_path(base_dir: &str, relative_path: &str) -> String {
     segments.join("/")
 }
 
-/// Decodes numeric/hex HTML character references and `&colon;` while stripping
-/// ASCII whitespace and control characters for scheme inspection.
+/// Decodes numeric/hex HTML character references (with or without a trailing `;`)
+/// and `&colon;` while stripping ASCII whitespace and control characters for scheme inspection.
 #[must_use]
 fn decode_for_scheme_check(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -145,6 +145,36 @@ fn decode_for_scheme_check(input: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'&' {
+            if bytes.get(i + 1) == Some(&b'#') {
+                let is_hex = matches!(bytes.get(i + 2), Some(b'x' | b'X'));
+                let digits_start = if is_hex { i + 3 } else { i + 2 };
+                let mut end = digits_start;
+                while end < bytes.len()
+                    && ((is_hex && bytes[end].is_ascii_hexdigit())
+                        || (!is_hex && bytes[end].is_ascii_digit()))
+                {
+                    end += 1;
+                }
+                let digits = &input[digits_start..end];
+                if end < bytes.len() && bytes[end] == b';' {
+                    end += 1;
+                }
+                let radix = if is_hex { 16 } else { 10 };
+                let decoded = if digits.is_empty() {
+                    '\u{FFFD}'
+                } else {
+                    u32::from_str_radix(digits, radix)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{FFFD}')
+                };
+                if !decoded.is_control() && !decoded.is_ascii_whitespace() {
+                    out.push(decoded);
+                }
+                i = end;
+                continue;
+            }
+
             if let Some(rel_end) = bytes[i..].iter().position(|&b| b == b';') {
                 let entity = &input[i + 1..i + rel_end];
                 if let Some(decoded) = decode_html_entity(entity) {
@@ -174,16 +204,7 @@ fn decode_html_entity(entity: &str) -> Option<char> {
     if entity.eq_ignore_ascii_case("tab") || entity.eq_ignore_ascii_case("newline") {
         return Some(' ');
     }
-    let num_str = entity.strip_prefix('#')?;
-    let code = if let Some(hex) = num_str
-        .strip_prefix('x')
-        .or_else(|| num_str.strip_prefix('X'))
-    {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        num_str.parse::<u32>().ok()?
-    };
-    char::from_u32(code)
+    None
 }
 
 #[must_use]
@@ -317,6 +338,14 @@ pub fn resolve_markdown_url(
         return (!out.is_empty()).then_some(out);
     }
 
+    if path_part.contains(':')
+        || path_part.contains("&#")
+        || has_scheme_prefix(path_part)
+        || has_scheme_prefix(&decode_for_scheme_check(path_part))
+    {
+        return None;
+    }
+
     let is_dir = is_directory_target(path_part);
     if is_image && is_dir {
         return None;
@@ -324,6 +353,13 @@ pub fn resolve_markdown_url(
 
     let base_dir = ctx.map_or("", |c| c.current_dir.as_str());
     let resolved_path = normalize_repo_path(base_dir, path_part);
+
+    if resolved_path.contains(':')
+        || has_scheme_prefix(&resolved_path)
+        || has_scheme_prefix(&decode_for_scheme_check(&resolved_path))
+    {
+        return None;
+    }
 
     let mut resolved = if let Some(context) = ctx {
         if is_dir {
@@ -365,6 +401,7 @@ fn is_relative_repo_target(raw_url: &str) -> bool {
         && !trimmed.starts_with("//")
         && !has_scheme_prefix(trimmed)
         && !has_scheme_prefix(&decode_for_scheme_check(trimmed))
+        && resolve_markdown_url(trimmed, None, false).is_some()
 }
 
 #[must_use]
@@ -1154,8 +1191,16 @@ fn main() {
             "<img src=x onerror=alert(1)>",
             "<iframe src=\"javascript:alert(1)\"></iframe>",
             "[click](javascript:alert(1))",
+            "[click](./javascript:alert(1))",
+            "[click](../javascript:alert(1))",
+            "[click](/javascript:alert(1))",
+            "[click](./data:text/html,<script>alert(1)</script>)",
             "[click](&#x6a;avascript:alert(1))",
             "[click](&#106;avascript:alert(1))",
+            "[click](&#106avascript:alert(1))",
+            "[click](&#x6aavascript:alert(1))",
+            "[click](&#99999999999;javascript:alert(1))",
+            "[click](&#x110000;javascript:alert(1))",
             "[click](JaVaScRiPt:alert(1))",
             "[click](java\nscript:alert(1))",
             "[click](java\tscript:alert(1))",
@@ -1164,6 +1209,7 @@ fn main() {
             "[click](file:///etc/passwd)",
             "[click](//evil.example.com/xss)",
             "![img](javascript:alert(1))",
+            "![img](./javascript:alert(1))",
             "![img](data:image/svg+xml,<svg onload=alert(1)>)",
             "![img](//evil.example.com/pixel.png)",
         ];
@@ -1214,8 +1260,16 @@ fn main() {
             "",
             "   ",
             "javascript:alert(1)",
+            "./javascript:alert(1)",
+            "../javascript:alert(1)",
+            "/javascript:alert(1)",
+            "./data:text/html,<script>alert(1)</script>",
             "&#x6a;avascript:alert(1)",
             "&#106;avascript:alert(1)",
+            "&#106avascript:alert(1)",
+            "&#x6aavascript:alert(1)",
+            "&#99999999999;javascript:alert(1)",
+            "&#x110000;javascript:alert(1)",
             "javascript&colon;alert(1)",
             "JaVaScRiPt:alert(1)",
             "java\nscript:alert(1)",
@@ -1231,15 +1285,27 @@ fn main() {
             "https://",
             "mailto:",
         ] {
+            let sample_ctx =
+                MarkdownContext::new("users", "alice", "public", "dotfiles", "main", "docs");
             assert_eq!(
                 resolve_markdown_url(bad_url, None, false),
                 None,
-                "expected link URL `{bad_url}` to be rejected"
+                "expected link URL `{bad_url}` to be rejected without context"
+            );
+            assert_eq!(
+                resolve_markdown_url(bad_url, Some(&sample_ctx), false),
+                None,
+                "expected link URL `{bad_url}` to be rejected with context"
             );
             assert_eq!(
                 resolve_markdown_url(bad_url, None, true),
                 None,
-                "expected image URL `{bad_url}` to be rejected"
+                "expected image URL `{bad_url}` to be rejected without context"
+            );
+            assert_eq!(
+                resolve_markdown_url(bad_url, Some(&sample_ctx), true),
+                None,
+                "expected image URL `{bad_url}` to be rejected with context"
             );
             assert!(!is_safe_markdown_url(bad_url, false));
             assert!(!is_safe_markdown_url(bad_url, true));
