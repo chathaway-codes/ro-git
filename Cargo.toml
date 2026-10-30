@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ro-git-cli",
     "crates/ro-git-proto",
     "crates/ro-git-server",
     "crates/ro-git-ui",
@@ -18,6 +19,7 @@ roto-grpc = { git = "https://github.com/chathaway-codes/roto", default-features 
 google-protobuf-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
 grpc-reflection-roto = { git = "https://github.com/chathaway-codes/roto", default-features = false }
 ro-git-proto = { path = "crates/ro-git-proto", default-features = false }
+ro-git-server = { path = "crates/ro-git-server", default-features = false }
 nix = { version = "0.31", default-features = false }
 ssh-key = { version = "0.6.7", default-features = false }
 yew = { version = "0.21", default-features = false }

@@ -1213,6 +1213,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ro-git-cli"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "ro-git-proto",
+ "ro-git-server",
+ "roto-grpc",
+ "ssh-key",
+]
+
+[[package]]
 name = "ro-git-proto"
 version = "0.1.0"
 dependencies = [

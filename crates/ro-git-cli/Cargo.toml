@@ -1,0 +1,19 @@
+[package]
+name = "ro-git-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line client for listing, searching, and pushing ro-git repositories over gRPC and SSH"
+
+[[bin]]
+name = "ro-git-cli"
+path = "src/main.rs"
+
+[dependencies]
+ro-git-proto = { workspace = true, features = ["std"] }
+roto-grpc = { workspace = true, features = ["std"] }
+nix = { workspace = true, features = ["user"] }
+ssh-key = { workspace = true, features = ["alloc", "ed25519", "rsa", "std"] }
+
+[dev-dependencies]
+ro-git-server = { workspace = true }
