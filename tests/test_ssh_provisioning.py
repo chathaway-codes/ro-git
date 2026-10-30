@@ -415,6 +415,7 @@ class TestProductionDockerAndEntrypoint(unittest.TestCase):
         self.assertIn("/usr/local/bin/docker-entrypoint.sh", dockerfile)
         self.assertIn("/usr/local/share/ro-git/sshd_config", dockerfile)
         self.assertIn("/etc/ssh/sshd_config", dockerfile)
+        self.assertNotIn("safe.directory", dockerfile)
         self.assertIn("EXPOSE 22 8080", dockerfile)
         self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]', dockerfile)
 

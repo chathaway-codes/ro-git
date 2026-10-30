@@ -624,6 +624,7 @@ fn populate_bare_repo_fixture(bare_dir: &Path, work_dir: &Path) {
     let out = std::process::Command::new("git")
         .current_dir(bare_dir)
         .args(["init", "--bare", "--initial-branch=main"])
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
         .output()
         .expect("git init --bare");
     assert!(out.status.success());
@@ -640,6 +641,7 @@ fn populate_bare_repo_fixture(bare_dir: &Path, work_dir: &Path) {
             .env("GIT_COMMITTER_NAME", "Alice")
             .env("GIT_COMMITTER_EMAIL", "alice@example.com")
             .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
             .output()
             .expect("git command");
         assert!(
@@ -1006,6 +1008,31 @@ fn end_to_end_object_inspection_over_grpc_and_http() {
 
 #[test]
 fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
+    // Re-exec in an isolated child process with `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` so we
+    // simulate cross-UID repository ownership (e.g. `nobody` serving a repository owned by `charles`)
+    // without mutating process-global environment variables in a multi-threaded test runner.
+    if std::env::var_os("GIT_TEST_ASSUME_DIFFERENT_OWNER").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        let current_exe = std::env::current_exe().expect("locate current test executable");
+        let out = std::process::Command::new(current_exe)
+            .args([
+                "--exact",
+                "end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push",
+                "--nocapture",
+            ])
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .output()
+            .expect("spawn child test with GIT_TEST_ASSUME_DIFFERENT_OWNER=1");
+        assert!(
+            out.status.success(),
+            "Smart HTTP child test with GIT_TEST_ASSUME_DIFFERENT_OWNER=1 failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
     let (root_dir, _alice_priv) = setup_fixture_root();
     let static_dir = setup_static_dir();
     let root = root_dir.path();
@@ -1036,6 +1063,28 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
     .expect("start_server for Smart HTTP test");
     let addr = server.local_addr();
 
+    // 0. Verify `git_reader::run_git` (`GetRepository`) and `git_reader::read_blob_bytes_bounded` (`GetBlob`)
+    // succeed under `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`.
+    let repo_api = format_repository_api_path("teams", "core", "public", "ro-git");
+    let repo_resp = send_http1_request(addr, "GET", &repo_api, &[]);
+    assert_eq!(repo_resp.status_code, 200);
+    let repo_view = GetRepositoryResponseView::from_bytes(&repo_resp.body).unwrap();
+    assert_eq!(repo_view.head_ref().unwrap(), "main");
+
+    let blob_api = format_blob_api_path("teams", "core", "public", "ro-git");
+    let blob_resp = send_http1_request(
+        addr,
+        "GET",
+        &format!("{blob_api}?revision=main&path=README.md"),
+        &[],
+    );
+    assert_eq!(blob_resp.status_code, 200);
+    let blob_view = GetBlobResponseView::from_bytes(&blob_resp.body).unwrap();
+    assert_eq!(
+        blob_view.content().unwrap(),
+        b"# ro-git\nInitial docs.\nSecond line.\n"
+    );
+
     // 1. Real `git clone` over HTTP using Git Protocol v2 (default) with `.git` suffix
     let clone_dest = TempDir::new("smart-http-clone-v2");
     let public_url = format!("http://{addr}/teams/core/public/ro-git.git");
@@ -1043,6 +1092,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .args(["clone", &public_url])
         .arg(clone_dest.path().join("ro-git"))
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
         .output()
         .expect("git clone over Smart HTTP v2");
     assert!(
@@ -1064,6 +1114,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .args(["-c", "protocol.version=0", "clone", &public_url_no_git])
         .arg(clone_v0_dest.path().join("ro-git"))
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
         .output()
         .expect("git clone over Smart HTTP v0");
     assert!(
@@ -1090,6 +1141,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .args(["clone", &priv_url])
         .arg(priv_clone_dest.path().join("roadmap"))
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
         .output()
         .expect("attempt git clone private repo over HTTP");
     assert!(

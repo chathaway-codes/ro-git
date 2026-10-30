@@ -2424,7 +2424,10 @@ fn spawn_git_upload_pack(
     nobody_uid: u32,
 ) -> io::Result<std::process::Child> {
     let mut cmd = Command::new("git");
-    cmd.arg("--no-optional-locks").arg("upload-pack");
+    cmd.arg("--no-optional-locks")
+        .arg("-c")
+        .arg("safe.directory=*")
+        .arg("upload-pack");
     if advertise_refs {
         cmd.arg("--stateless-rpc").arg("--advertise-refs");
     } else {
@@ -2434,6 +2437,7 @@ fn spawn_git_upload_pack(
         .arg(repo_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("LC_ALL", "C")
         .stdin(if advertise_refs {
             Stdio::null()
@@ -2518,6 +2522,12 @@ fn handle_git_smart_http(
                 return H1Response::plain_error(500, "git upload-pack failed", omit_body);
             };
             if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "git upload-pack --advertise-refs failed ({}): {}",
+                    out.status,
+                    stderr.trim()
+                );
                 return H1Response::plain_error(404, "repository not found", omit_body);
             }
 
@@ -2558,6 +2568,12 @@ fn handle_git_smart_http(
                 return H1Response::plain_error(500, "git upload-pack failed", false);
             };
             if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "git upload-pack failed ({}): {}",
+                    out.status,
+                    stderr.trim()
+                );
                 return H1Response::plain_error(500, "git upload-pack failed", false);
             }
 
