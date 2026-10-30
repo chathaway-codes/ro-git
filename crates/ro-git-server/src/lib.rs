@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use grpc_reflection_roto::ReflectionService;
 use nix::unistd::{geteuid, setgid, setgroups, setuid, Gid, Uid};
 
 use ro_git_proto::grpc::ro_git::v1::git_service::{GitService, GitServiceServer};
@@ -3125,7 +3126,11 @@ pub fn serve_tcp_stream(mut stream: TcpStream, config: ServerConfig) -> io::Resu
     if is_h2 {
         let static_service = StaticAssetService::with_config(&config);
         let git_service = GitServiceHandler::new(config).into_server();
-        let routes: [&dyn Route; 2] = [&git_service, &static_service];
+        let grpc_routes: [&dyn Route; 1] = [&git_service];
+        let reflection = ReflectionService::new(&grpc_routes);
+        let refl_v1 = reflection.v1_server();
+        let refl_v1alpha = reflection.v1alpha_server();
+        let routes: [&dyn Route; 4] = [&git_service, &refl_v1, &refl_v1alpha, &static_service];
         let mut msg_buf = vec![0u8; 512 * 1024];
         let mut tx_buf = vec![0u8; 512 * 1024];
         let mut server =

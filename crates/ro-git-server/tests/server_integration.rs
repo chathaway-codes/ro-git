@@ -1192,3 +1192,181 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
     server.shutdown();
 }
 
+fn verify_reflection_v1(addr: SocketAddr) {
+    use grpc_reflection_roto::grpc::reflection::v1::server_reflection_response::MessageResponse as V1Resp;
+    use grpc_reflection_roto::services::grpc::reflection::v1::ServerReflectionClient as V1ReflectionClient;
+
+    let tcp = TcpStream::connect(addr).expect("connect v1 reflection TCP stream");
+    let _ = tcp.set_nodelay(true);
+    let mut tx_buf = vec![0u8; 65_536];
+    let mut call_buf = vec![0u8; 131_072];
+    let grpc_client = GrpcClient::<1, 131_072, DynamicMetadata>::with_metadata_store(
+        "http",
+        "git.example.com",
+        &mut tx_buf,
+    );
+    let transport =
+        StdClientTransport::<TcpStream, 1, 131_072, 4096, DynamicMetadata>::with_metadata_store_and_io_buf(
+            tcp,
+            grpc_client,
+            &mut call_buf,
+        );
+    let mut v1_client = V1ReflectionClient::new(transport);
+
+    let mut stream = v1_client
+        .server_reflection_info(|tx| {
+            tx.send(|req| {
+                req.write_list_services("*").write_host("git.example.com");
+            })?;
+            tx.send(|req| {
+                req.write_file_containing_symbol("ro_git.v1.GitService")
+                    .write_host("git.example.com");
+            })
+        })
+        .expect("v1 reflection bidi call");
+
+    let r1 = stream
+        .next()
+        .expect("v1 list_services item")
+        .expect("v1 list_services ok");
+    match r1.message_response().expect("decode v1 response") {
+        Some(V1Resp::ListServicesResponse(ls)) => {
+            let names: Vec<&str> = ls.service().map(|s| s.unwrap().name().unwrap()).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "ro_git.v1.GitService",
+                    "grpc.reflection.v1.ServerReflection",
+                    "grpc.reflection.v1alpha.ServerReflection",
+                ]
+            );
+        }
+        other => panic!("expected v1 ListServicesResponse, got {other:?}"),
+    }
+
+    let r2 = stream
+        .next()
+        .expect("v1 file_containing_symbol item")
+        .expect("v1 file_containing_symbol ok");
+    match r2.message_response().expect("decode v1 descriptor response") {
+        Some(V1Resp::FileDescriptorResponse(fdr)) => {
+            let first_proto = fdr
+                .file_descriptor_proto()
+                .next()
+                .expect("at least one FileDescriptorProto")
+                .expect("valid FileDescriptorProto bytes");
+            assert_eq!(
+                first_proto,
+                ro_git_proto::grpc::ro_git::v1::git_service::FILE_DESCRIPTOR_BYTES
+            );
+        }
+        other => panic!("expected v1 FileDescriptorResponse, got {other:?}"),
+    }
+    assert!(stream.next().expect("v1 stream end").is_none());
+}
+
+fn verify_reflection_v1alpha(addr: SocketAddr) {
+    use grpc_reflection_roto::grpc::reflection::v1alpha::server_reflection_response::MessageResponse as V1AlphaResp;
+    use grpc_reflection_roto::services::grpc::reflection::v1alpha::ServerReflectionClient as V1AlphaReflectionClient;
+
+    let tcp = TcpStream::connect(addr).expect("connect v1alpha reflection TCP stream");
+    let _ = tcp.set_nodelay(true);
+    let mut tx_buf = vec![0u8; 65_536];
+    let mut call_buf = vec![0u8; 131_072];
+    let grpc_client = GrpcClient::<1, 131_072, DynamicMetadata>::with_metadata_store(
+        "http",
+        "git.example.com",
+        &mut tx_buf,
+    );
+    let transport =
+        StdClientTransport::<TcpStream, 1, 131_072, 4096, DynamicMetadata>::with_metadata_store_and_io_buf(
+            tcp,
+            grpc_client,
+            &mut call_buf,
+        );
+    let mut v1alpha_client = V1AlphaReflectionClient::new(transport);
+
+    let mut stream = v1alpha_client
+        .server_reflection_info(|tx| {
+            tx.send(|req| {
+                req.write_list_services("*").write_host("git.example.com");
+            })?;
+            tx.send(|req| {
+                req.write_file_by_filename("ro_git/v1/git.proto")
+                    .write_host("git.example.com");
+            })
+        })
+        .expect("v1alpha reflection bidi call");
+
+    let r1 = stream
+        .next()
+        .expect("v1alpha list_services item")
+        .expect("v1alpha list_services ok");
+    match r1.message_response().expect("decode v1alpha response") {
+        Some(V1AlphaResp::ListServicesResponse(ls)) => {
+            let names: Vec<&str> = ls.service().map(|s| s.unwrap().name().unwrap()).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "ro_git.v1.GitService",
+                    "grpc.reflection.v1.ServerReflection",
+                    "grpc.reflection.v1alpha.ServerReflection",
+                ]
+            );
+        }
+        other => panic!("expected v1alpha ListServicesResponse, got {other:?}"),
+    }
+
+    let r2 = stream
+        .next()
+        .expect("v1alpha file_by_filename item")
+        .expect("v1alpha file_by_filename ok");
+    match r2.message_response().expect("decode v1alpha descriptor response") {
+        Some(V1AlphaResp::FileDescriptorResponse(fdr)) => {
+            let first_proto = fdr
+                .file_descriptor_proto()
+                .next()
+                .expect("at least one FileDescriptorProto")
+                .expect("valid FileDescriptorProto bytes");
+            assert_eq!(
+                first_proto,
+                ro_git_proto::grpc::ro_git::v1::git_service::FILE_DESCRIPTOR_BYTES
+            );
+        }
+        other => panic!("expected v1alpha FileDescriptorResponse, got {other:?}"),
+    }
+    assert!(stream.next().expect("v1alpha stream end").is_none());
+}
+
+#[test]
+fn end_to_end_grpc_reflection_v1_and_v1alpha() {
+    let (root_dir, _alice_priv) = setup_fixture_root();
+    let static_dir = setup_static_dir();
+
+    let server = start_server(ServerConfig {
+        listen_addr: String::from("127.0.0.1:0"),
+        root_dir: root_dir.path().to_string_lossy().into_owned(),
+        ssh_host: String::from("git.example.com"),
+        https_host: String::from("git.example.com"),
+        static_dir: static_dir.path().to_string_lossy().into_owned(),
+        max_token_ttl_secs: 2_592_000,
+        nobody_uid: 65_534,
+        dev_user: None,
+    })
+    .expect("start_server for reflection test");
+    let addr = server.local_addr();
+
+    std::thread::Builder::new()
+        .name(String::from("reflection-test-client"))
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            verify_reflection_v1(addr);
+            verify_reflection_v1alpha(addr);
+        })
+        .expect("spawn reflection client thread")
+        .join()
+        .expect("reflection client thread panicked");
+
+    server.shutdown();
+}
+
