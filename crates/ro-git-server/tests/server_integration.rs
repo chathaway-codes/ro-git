@@ -625,6 +625,7 @@ fn populate_bare_repo_fixture(bare_dir: &Path, work_dir: &Path) {
         .current_dir(bare_dir)
         .args(["init", "--bare", "--initial-branch=main"])
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
+        .env("HOME", work_dir)
         .output()
         .expect("git init --bare");
     assert!(out.status.success());
@@ -642,6 +643,7 @@ fn populate_bare_repo_fixture(bare_dir: &Path, work_dir: &Path) {
             .env("GIT_COMMITTER_EMAIL", "alice@example.com")
             .env("GIT_COMMITTER_DATE", date)
             .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
+            .env("HOME", work_dir)
             .output()
             .expect("git command");
         assert!(
@@ -1022,6 +1024,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
                 "--nocapture",
             ])
             .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .env("HOME", "/root")
             .output()
             .expect("spawn child test with GIT_TEST_ASSUME_DIFFERENT_OWNER=1");
         assert!(
@@ -1064,7 +1067,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
     let addr = server.local_addr();
 
     // 0. Verify `git_reader::run_git` (`GetRepository`) and `git_reader::read_blob_bytes_bounded` (`GetBlob`)
-    // succeed under `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`.
+    // succeed under `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` and `HOME=/root`.
     let repo_api = format_repository_api_path("teams", "core", "public", "ro-git");
     let repo_resp = send_http1_request(addr, "GET", &repo_api, &[]);
     assert_eq!(repo_resp.status_code, 200);
@@ -1093,12 +1096,17 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .arg(clone_dest.path().join("ro-git"))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
+        .env("HOME", clone_dest.path())
         .output()
         .expect("git clone over Smart HTTP v2");
+    let v2_stderr = String::from_utf8_lossy(&clone_v2_out.stderr);
     assert!(
         clone_v2_out.status.success(),
-        "git clone v2 failed: {}",
-        String::from_utf8_lossy(&clone_v2_out.stderr)
+        "git clone v2 failed: {v2_stderr}"
+    );
+    assert!(
+        !v2_stderr.contains("Permission denied") && !v2_stderr.contains("unable to access"),
+        "unexpected remote warning in git clone stderr: {v2_stderr}"
     );
     let cloned_readme =
         fs::read_to_string(clone_dest.path().join("ro-git/README.md")).expect("read cloned README");
@@ -1115,12 +1123,17 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .arg(clone_v0_dest.path().join("ro-git"))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
+        .env("HOME", clone_v0_dest.path())
         .output()
         .expect("git clone over Smart HTTP v0");
+    let v0_stderr = String::from_utf8_lossy(&clone_v0_out.stderr);
     assert!(
         clone_v0_out.status.success(),
-        "git clone v0 failed: {}",
-        String::from_utf8_lossy(&clone_v0_out.stderr)
+        "git clone v0 failed: {v0_stderr}"
+    );
+    assert!(
+        !v0_stderr.contains("Permission denied") && !v0_stderr.contains("unable to access"),
+        "unexpected remote warning in git clone v0 stderr: {v0_stderr}"
     );
     let v0_readme = fs::read_to_string(clone_v0_dest.path().join("ro-git/README.md"))
         .expect("read v0 cloned README");
@@ -1142,6 +1155,7 @@ fn end_to_end_smart_http_clone_for_public_repos_and_reject_private_and_push() {
         .arg(priv_clone_dest.path().join("roadmap"))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "0")
+        .env("HOME", priv_clone_dest.path())
         .output()
         .expect("attempt git clone private repo over HTTP");
     assert!(

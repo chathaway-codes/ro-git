@@ -1225,6 +1225,8 @@ fn drop_worker_privileges(uid: u32, gid: u32, supplementary_gids: &[u32]) -> Res
 pub fn spawn_worker_subprocess(worker_bin: &Path, req_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(worker_bin)
         .arg("git-worker")
+        .env("HOME", "/nonexistent")
+        .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2437,7 +2439,10 @@ fn spawn_git_upload_pack(
         .arg(repo_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("HOME", "/nonexistent")
+        .env_remove("XDG_CONFIG_HOME")
         .env("LC_ALL", "C")
         .stdin(if advertise_refs {
             Stdio::null()

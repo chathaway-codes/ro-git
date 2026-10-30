@@ -256,6 +256,10 @@ fn run_git(repo_dir: &Path, args: &[&str]) -> Result<Output, GitReaderError> {
         .args(args)
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", "/nonexistent")
+        .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -615,6 +619,10 @@ fn read_blob_bytes_bounded(
         .args(["cat-file", "blob", blob_oid])
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", "/nonexistent")
+        .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
