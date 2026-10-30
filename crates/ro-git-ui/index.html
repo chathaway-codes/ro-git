@@ -274,7 +274,6 @@
 
       .repo-card {
         display: flex;
-        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
         gap: 0.85rem;
@@ -284,6 +283,11 @@
 
       .repo-card:last-child {
         border-bottom: none;
+      }
+
+      .repo-card-main {
+        flex: 1 1 0%;
+        min-width: 0;
       }
 
       .repo-title-row {
@@ -336,22 +340,44 @@
 
       .repo-command-preview {
         margin-top: 0.25rem;
+        min-width: 0;
       }
 
       .repo-command-preview code {
+        display: inline-block;
+        max-width: 100%;
         font-size: 0.78rem;
         color: var(--text);
         background: var(--panel-alt);
         padding: 0.15rem 0.45rem;
         border-radius: 4px;
         border: 1px solid var(--border);
-        word-break: break-all;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: bottom;
       }
 
       .repo-card-actions {
         display: flex;
-        flex-wrap: wrap;
+        align-items: center;
+        flex-shrink: 0;
         gap: 0.5rem;
+      }
+
+      @media (max-width: 780px) {
+        .repo-card {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .repo-card-main {
+          width: 100%;
+        }
+
+        .repo-card-actions {
+          flex-wrap: wrap;
+        }
       }
 
       .empty-state {
@@ -639,13 +665,18 @@
       }
 
       .repo-clone-snippet {
+        flex: 0 1 auto;
+        min-width: 0;
+        max-width: 100%;
         font-size: 0.78rem;
         color: var(--text);
         background: var(--panel-alt);
-        padding: 0.25rem 0.55rem;
+        padding: 0.22rem 0.55rem;
         border-radius: 4px;
         border: 1px solid var(--border);
-        word-break: break-all;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       .repo-nav-bar {
@@ -905,7 +936,12 @@
       .blob-mode-toggle,
       .clone-protocol-toggle {
         display: inline-flex;
+        align-items: center;
         gap: 0.25rem;
+      }
+
+      .clone-protocol-toggle .toggle-btn {
+        font-family: var(--mono);
       }
 
       .toggle-btn-active {

@@ -515,7 +515,7 @@ fn render_repo_card(
                 }
                 <button
                     type="button"
-                    class={classes!("btn", "btn-copy", is_cmd_copied.then_some("btn-copied"))}
+                    class={classes!("btn", "btn-copy", "btn-sm", is_cmd_copied.then_some("btn-copied"))}
                     onclick={on_copy_cmd}
                     title={active_cmd}
                 >
@@ -523,7 +523,7 @@ fn render_repo_card(
                 </button>
                 <button
                     type="button"
-                    class={classes!("btn", "btn-copy", is_url_copied.then_some("btn-copied"))}
+                    class={classes!("btn", "btn-copy", "btn-sm", is_url_copied.then_some("btn-copied"))}
                     onclick={on_copy_url}
                     title={active_url}
                 >
